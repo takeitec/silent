@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"silent/internal/discovery"
+	"silent/internal/models"
 	"silent/internal/peerlist"
 	"silent/internal/sync"
 )
@@ -28,12 +29,12 @@ func main() {
 
 	pl := peerlist.New()
 	ann := discovery.NewAnnouncer(*id, *port)
-	ann.SetSeenCallback(func(p discovery.Peer) {
+	ann.SetSeenCallback(func(p models.Peer) {
 		host := p.Address
 		if h, _, err := net.SplitHostPort(p.Address); err == nil {
 			host = h
 		}
-		pl.Add(p.ID, host)
+		pl.Add(p.ID, host, p.Role)
 	})
 
 	controlPort := *controlPortFlag
@@ -49,7 +50,7 @@ func main() {
 	offsetCh := make(chan time.Duration, 1)
 	go func() {
 		for {
-			if err := ann.Announce(); err != nil {
+			if err := ann.Announce(*leader); err != nil {
 				log.Printf("announce failed: %v", err)
 			}
 			time.Sleep(1 * time.Second)
@@ -85,8 +86,8 @@ func main() {
 	} else {
 		go func() {
 			time.Sleep(1 * time.Second)
-			if peers := pl.Peers(); len(peers) > 0 {
-				if err := probeLeader(peers[0], *id, controlPort, offsetCh); err != nil {
+			if leader := pl.Leader(); leader != nil {
+				if err := probeLeader(*leader, *id, controlPort, offsetCh); err != nil {
 					log.Printf("clock sync failed: %v", err)
 				}
 			}
@@ -128,21 +129,6 @@ func handleControl(listener *net.UDPConn, leader bool, id, wavPath string, offse
 			response := fmt.Sprintf("SYNC-ACK|%d|%d", recv.UnixNano(), serverSend.UnixNano())
 			_, _ = listener.WriteToUDP([]byte(response), addr)
 			fmt.Printf("leader received sync ping from %s\n", addr.String())
-		case "SYNC-ACK":
-			if leader || len(parts) < 3 {
-				continue
-			}
-			clientSend := time.Now()
-			serverRecvNanos, _ := strconv.ParseInt(parts[1], 10, 64)
-			serverSendNanos, _ := strconv.ParseInt(parts[2], 10, 64)
-			serverRecv := time.Unix(0, serverRecvNanos)
-			serverSend := time.Unix(0, serverSendNanos)
-			offset = sync.ComputeOffset(clientSend, serverRecv, serverSend, recv)
-			select {
-			case offsetCh <- offset:
-			default:
-			}
-			fmt.Printf("%s synced with leader, offset=%s\n", id, offset)
 		case "PLAY":
 			if leader || len(parts) < 3 {
 				continue
@@ -164,8 +150,8 @@ func handleControl(listener *net.UDPConn, leader bool, id, wavPath string, offse
 	}
 }
 
-func probeLeader(peer string, id string, controlPort int, offsetCh chan time.Duration) error {
-	addr, err := parsePeerAddress(peer, controlPort)
+func probeLeader(peer models.Peer, id string, controlPort int, offsetCh chan time.Duration) error {
+	addr, err := parsePeerAddress(peer.Address, controlPort)
 	if err != nil {
 		return err
 	}
