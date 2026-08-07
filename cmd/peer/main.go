@@ -46,6 +46,7 @@ func main() {
 			host = h
 		}
 		pl.Add(p.ID, host, p.Role)
+		log.Printf("discovered peer %s (%s) role=%s", p.ID, host, p.Role)
 	})
 
 	controlPort := *controlPortFlag
@@ -96,11 +97,21 @@ func main() {
 		}()
 	} else {
 		go func() {
-			time.Sleep(1 * time.Second)
-			if leader := pl.Leader(); leader != nil {
-				if err := probeLeader(*leader, *id, controlPort, offsetCh); err != nil {
-					log.Printf("clock sync failed: %v", err)
+			log.Printf("follower %s waiting for leader discovery", *id)
+
+			for {
+				leader := pl.Leader()
+				if leader != nil {
+					log.Printf("follower %s discovered leader %s at %s", *id, leader.ID, leader.Address)
+
+					if err := probeLeader(*leader, *id, controlPort, offsetCh); err != nil {
+						log.Printf("clock sync failed: %v", err)
+					}
+				} else {
+					log.Printf("follower %s has not discovered a leader yet", *id)
 				}
+
+				time.Sleep(2 * time.Second)
 			}
 		}()
 	}
