@@ -21,14 +21,25 @@ import (
 
 func main() {
 	id := flag.String("id", "peer-1", "node identifier")
+	broadcastIP := flag.String("broadcast-ip", "255.255.255.255", "broadcast address for peer discovery/scheduling")
 	port := flag.Int("port", 9999, "UDP discovery port")
 	controlPortFlag := flag.Int("control-port", 0, "UDP control port")
 	leader := flag.Bool("leader", false, "act as the leader for scheduling")
 	wavPath := flag.String("wav", "", "optional wav file to play")
 	flag.Parse()
 
+	broadcastAddr, err := validateBroadcastIP(*broadcastIP)
+	if err != nil {
+		log.Fatalf("invalid broadcast IP: %v", err)
+	}
+
 	pl := peerlist.New()
-	ann := discovery.NewAnnouncer(*id, *port)
+	ann := discovery.NewAnnouncer(discovery.Config{
+		ID:          *id,
+		Port:        *port,
+		Leader:      *leader,
+		BroadcastIP: broadcastAddr,
+	})
 	ann.SetSeenCallback(func(p models.Peer) {
 		host := p.Address
 		if h, _, err := net.SplitHostPort(p.Address); err == nil {
@@ -50,7 +61,7 @@ func main() {
 	offsetCh := make(chan time.Duration, 1)
 	go func() {
 		for {
-			if err := ann.Announce(*leader); err != nil {
+			if err := ann.Announce(); err != nil {
 				log.Printf("announce failed: %v", err)
 			}
 			time.Sleep(1 * time.Second)
@@ -78,7 +89,7 @@ func main() {
 		go func() {
 			time.Sleep(2 * time.Second)
 			shared := time.Now().Add(3 * time.Second)
-			if err := broadcastSchedule(controlPort, *id, shared, *wavPath); err != nil {
+			if err := broadcastSchedule(controlPort, *id, shared, *wavPath, broadcastAddr); err != nil {
 				log.Printf("broadcast failed: %v", err)
 			}
 			fmt.Printf("leader broadcast shared playback at %s\n", shared.Format(time.RFC3339Nano))
@@ -190,26 +201,67 @@ func probeLeader(peer models.Peer, id string, controlPort int, offsetCh chan tim
 }
 
 func parsePeerAddress(peer string, controlPort int) (string, error) {
-	parts := strings.SplitN(peer, "@", 2)
-	if len(parts) != 2 || strings.TrimSpace(parts[1]) == "" {
-		return "", fmt.Errorf("invalid peer address %q", peer)
+	host := strings.TrimSpace(peer)
+
+	if strings.Contains(host, "@") {
+		parts := strings.SplitN(host, "@", 2)
+		if len(parts) != 2 || strings.TrimSpace(parts[1]) == "" {
+			return "", fmt.Errorf("invalid peer address %q", peer)
+		}
+		host = strings.TrimSpace(parts[1])
 	}
 
-	host := strings.TrimSpace(parts[1])
 	if h, _, err := net.SplitHostPort(host); err == nil {
 		host = h
+	}
+
+	if host == "" {
+		return "", fmt.Errorf("invalid peer address %q", peer)
 	}
 
 	return net.JoinHostPort(host, strconv.Itoa(controlPort)), nil
 }
 
-func broadcastSchedule(controlPort int, id string, shared time.Time, wavPath string) error {
-	conn, err := net.DialUDP("udp4", nil, &net.UDPAddr{IP: net.IPv4bcast, Port: controlPort})
+func validateBroadcastIP(raw string) (string, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", fmt.Errorf("broadcast IP cannot be empty")
+	}
+
+	ip := net.ParseIP(raw)
+	if ip == nil {
+		return "", fmt.Errorf("invalid broadcast IP %q: must be a valid IP address", raw)
+	}
+
+	if ip.To4() == nil {
+		return "", fmt.Errorf("invalid broadcast IP %q: IPv6 is not supported here", raw)
+	}
+
+	if ip.IsLoopback() || ip.IsUnspecified() {
+		return "", fmt.Errorf("invalid broadcast IP %q: use a real broadcast address such as 192.168.1.255", raw)
+	}
+
+	if strings.Count(raw, ".") != 3 {
+		return "", fmt.Errorf("invalid broadcast IP %q: expected an IPv4 address", raw)
+	}
+
+	return ip.String(), nil
+}
+
+func broadcastSchedule(controlPort int, id string, shared time.Time, wavPath, broadcastAddr string) error {
+	conn, err := net.DialUDP("udp4", nil, &net.UDPAddr{IP: net.ParseIP(broadcastAddr), Port: controlPort})
 	if err != nil {
 		return err
 	}
 	defer conn.Close()
+
+	// if err := discovery.EnableBroadcast(conn); err != nil {
+	// 	return err
+	// }
+
 	msg := fmt.Sprintf("PLAY|%s|%d", id, shared.UnixNano())
+	log.Printf("main: sending PLAY to %s:%d -> %s", broadcastAddr, controlPort, msg)
+
 	_, err = conn.Write([]byte(msg))
 	return err
 }
