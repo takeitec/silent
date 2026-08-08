@@ -1,0 +1,32 @@
+syntax = "proto3";
+
+package control;
+
+option go_package = "silent/internal/control";
+
+service PeerControl {
+  rpc StartPlayback(PlaybackRequest) returns (PlaybackResponse);
+  rpc NotifyPlayback(PlaybackCommand) returns (PlaybackAck);
+}
+
+message PlaybackRequest {
+  string audio_id = 1;
+  string audio_path = 2;
+  int64 shared_at_nanos = 3;
+  bool immediate = 4;
+}
+
+message PlaybackResponse {
+  bool accepted = 1;
+  string message = 2;
+}
+
+message PlaybackCommand {
+  string audio_id = 1;
+  string audio_path = 2;
+  int64 shared_at_nanos = 3;
+}
+
+message PlaybackAck {
+  bool accepted = 1;
+}
