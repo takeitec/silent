@@ -2,7 +2,6 @@ package main
 
 import (
 	"fmt"
-	"log"
 	"net"
 	"strconv"
 	"strings"
@@ -12,9 +11,8 @@ import (
 	"silent/internal/sync"
 )
 
-func handleControl(listener *net.UDPConn, leader bool, id, wavPath string, offsetCh chan time.Duration) error {
+func handleControl(listener *net.UDPConn, leader bool) error {
 	buf := make([]byte, 1024)
-	var offset time.Duration
 
 	for {
 		n, addr, err := listener.ReadFromUDP(buf)
@@ -45,27 +43,6 @@ func handleControl(listener *net.UDPConn, leader bool, id, wavPath string, offse
 			response := fmt.Sprintf("SYNC-ACK|%d|%d", recv.UnixNano(), serverSend.UnixNano())
 			_, _ = listener.WriteToUDP([]byte(response), addr)
 			fmt.Printf("leader received sync ping from %s\n", addr.String())
-
-		case "PLAY":
-			if leader || len(parts) < 3 {
-				continue
-			}
-
-			sharedAtNanos, err := strconv.ParseInt(parts[2], 10, 64)
-			if err != nil {
-				continue
-			}
-			sharedAt := time.Unix(0, sharedAtNanos)
-
-			select {
-			case currentOffset := <-offsetCh:
-				offset = currentOffset
-			default:
-			}
-
-			localAt := sync.ConvertSharedTimeToLocal(sharedAt, offset)
-			fmt.Printf("scheduled playback for %s (local %s)\n", sharedAt.Format(time.RFC3339Nano), localAt.Format(time.RFC3339Nano))
-			go schedulePlayback(localAt, wavPath)
 		}
 	}
 }
@@ -167,18 +144,4 @@ func validateBroadcastIP(raw string) (string, error) {
 	}
 
 	return ip.String(), nil
-}
-
-func broadcastSchedule(controlPort int, id string, shared time.Time, wavPath, broadcastAddr string) error {
-	conn, err := net.DialUDP("udp4", nil, &net.UDPAddr{IP: net.ParseIP(broadcastAddr), Port: controlPort})
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
-
-	msg := fmt.Sprintf("PLAY|%s|%d", id, shared.UnixNano())
-	log.Printf("main: sending PLAY to %s:%d -> %s", broadcastAddr, controlPort, msg)
-
-	_, err = conn.Write([]byte(msg))
-	return err
 }

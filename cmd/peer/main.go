@@ -142,7 +142,7 @@ func (a *peerApp) Run() error {
 	}()
 
 	go func() {
-		if err := handleControl(a.listener, a.cfg.leader, a.cfg.id, a.cfg.wavPath, a.offsetCh); err != nil {
+		if err := handleControl(a.listener, a.cfg.leader); err != nil {
 			log.Printf("control loop stopped: %v", err)
 		}
 	}()
@@ -156,14 +156,6 @@ func (a *peerApp) Run() error {
 	fmt.Printf("peer %s listening on udp:%d (control:%d)\n", a.cfg.id, a.cfg.port, a.cfg.controlPort)
 	if a.cfg.leader {
 		fmt.Println("leader mode enabled")
-		go func() {
-			time.Sleep(2 * time.Second)
-			shared := time.Now().Add(3 * time.Second)
-			if err := broadcastSchedule(a.listener.LocalAddr().(*net.UDPAddr).Port, a.cfg.id, shared, a.cfg.wavPath, "255.255.255.255"); err != nil {
-				log.Printf("broadcast failed: %v", err)
-			}
-			fmt.Printf("leader broadcast shared playback at %s\n", shared.Format(time.RFC3339Nano))
-		}()
 	} else {
 		go func() {
 			log.Printf("follower %s waiting for leader discovery", a.cfg.id)
