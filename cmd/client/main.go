@@ -3,7 +3,10 @@ package main
 import (
 	"context"
 	"flag"
+	"fmt"
 	"log"
+	"os"
+	"time"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
@@ -12,12 +15,26 @@ import (
 )
 
 func main() {
-	addr := flag.String("leader-addr", "127.0.0.1:50051", "leader gRPC address")
-	audioID := flag.String("audio-id", "demo", "audio id")
-	audioPath := flag.String("audio-path", "demo.wav", "audio path")
-	flag.Parse()
+	if len(os.Args) < 2 {
+		usage()
+		os.Exit(2)
+	}
 
-	conn, err := grpc.NewClient(*addr,
+	command := os.Args[1]
+	args := os.Args[2:]
+
+	fs := flag.NewFlagSet("client", flag.ExitOnError)
+	leaderAddr := fs.String("leader-addr", "127.0.0.1:50051", "leader gRPC address")
+	audioID := fs.String("audio-id", "demo", "audio id")
+	audioPath := fs.String("audio-path", "demo.wav", "audio path")
+	sessionID := fs.String("session-id", fmt.Sprintf("session-%d", time.Now().Unix()), "stream session id")
+	sharedAt := fs.Int64("shared-at-nanos", time.Now().Add(3*time.Second).UnixNano(), "shared playback time in nanoseconds")
+
+	if err := fs.Parse(args); err != nil {
+		log.Fatalf("parse flags: %v", err)
+	}
+
+	conn, err := grpc.NewClient(*leaderAddr,
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 	)
 	if err != nil {
@@ -27,13 +44,44 @@ func main() {
 
 	client := control.NewPeerControlClient(conn)
 
-	resp, err := client.StartPlayback(context.Background(), &control.PlaybackRequest{
-		AudioId:   *audioID,
-		AudioPath: *audioPath,
-	})
-	if err != nil {
-		log.Fatalf("start playback failed: %v", err)
-	}
+	switch command {
+	case "play":
+		resp, err := client.StartPlayback(context.Background(), &control.PlaybackRequest{
+			AudioId:   *audioID,
+			AudioPath: *audioPath,
+		})
+		if err != nil {
+			log.Fatalf("start playback failed: %v", err)
+		}
+		log.Printf("play accepted=%v message=%s", resp.Accepted, resp.Message)
 
-	log.Printf("accepted=%v message=%s", resp.Accepted, resp.Message)
+	case "stream":
+		resp, err := client.StartStreamPlayback(context.Background(), &control.StreamPlaybackRequest{
+			SessionId:     *sessionID,
+			AudioId:       *audioID,
+			AudioPath:     *audioPath,
+			SharedAtNanos: *sharedAt,
+		})
+		if err != nil {
+			log.Fatalf("start stream playback failed: %v", err)
+		}
+		log.Printf("stream accepted=%v session=%s message=%s", resp.Accepted, resp.SessionId, resp.Message)
+
+	default:
+		usage()
+		os.Exit(2)
+	}
+}
+
+func usage() {
+	fmt.Println("usage:")
+	fmt.Println("  client play [flags]")
+	fmt.Println("  client stream [flags]")
+	fmt.Println("")
+	fmt.Println("flags:")
+	fmt.Println("  -leader-addr string")
+	fmt.Println("  -audio-id string")
+	fmt.Println("  -audio-path string")
+	fmt.Println("  -session-id string")
+	fmt.Println("  -shared-at-nanos int")
 }

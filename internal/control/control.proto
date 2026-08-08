@@ -7,6 +7,9 @@ option go_package = "silent/internal/control";
 service PeerControl {
   rpc StartPlayback(PlaybackRequest) returns (PlaybackResponse);
   rpc NotifyPlayback(PlaybackCommand) returns (PlaybackAck);
+
+  rpc StartStreamPlayback(StreamPlaybackRequest) returns (StreamPlaybackResponse);
+  rpc StreamAudio(StreamPlaybackRequest) returns (stream AudioChunk);
 }
 
 message PlaybackRequest {
@@ -29,4 +32,26 @@ message PlaybackCommand {
 
 message PlaybackAck {
   bool accepted = 1;
+}
+
+message StreamPlaybackRequest {
+  string session_id = 1;
+  string audio_id = 2;
+  string audio_path = 3;
+  int64 shared_at_nanos = 4;
+  bool relay = 5;
+}
+
+message StreamPlaybackResponse {
+  bool accepted = 1;
+  string session_id = 2;
+  string message = 3;
+}
+
+message AudioChunk {
+  string session_id = 1;
+  string audio_id = 2;
+  int64 sequence = 3;
+  bytes data = 4;
+  bool end_of_stream = 5;
 }

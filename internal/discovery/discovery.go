@@ -136,7 +136,7 @@ func (a *Announcer) Announce() error {
 	if a.Leader {
 		role = models.RoleLeader
 	}
-	msg := []byte(fmt.Sprintf("%s|%s", a.ID, role))
+	msg := fmt.Appendf(nil, "%s|%s", a.ID, role)
 	log.Printf("discovery: sending announce from %q as %s to %s:%d", a.ID, role, target.String(), a.Port)
 
 	_, err = conn.Write(msg)

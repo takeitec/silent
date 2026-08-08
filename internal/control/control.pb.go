@@ -245,6 +245,218 @@ func (x *PlaybackAck) GetAccepted() bool {
 	return false
 }
 
+type StreamPlaybackRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	SessionId     string                 `protobuf:"bytes,1,opt,name=session_id,json=sessionId,proto3" json:"session_id,omitempty"`
+	AudioId       string                 `protobuf:"bytes,2,opt,name=audio_id,json=audioId,proto3" json:"audio_id,omitempty"`
+	AudioPath     string                 `protobuf:"bytes,3,opt,name=audio_path,json=audioPath,proto3" json:"audio_path,omitempty"`
+	SharedAtNanos int64                  `protobuf:"varint,4,opt,name=shared_at_nanos,json=sharedAtNanos,proto3" json:"shared_at_nanos,omitempty"`
+	Relay         bool                   `protobuf:"varint,5,opt,name=relay,proto3" json:"relay,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *StreamPlaybackRequest) Reset() {
+	*x = StreamPlaybackRequest{}
+	mi := &file_internal_control_control_proto_msgTypes[4]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *StreamPlaybackRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*StreamPlaybackRequest) ProtoMessage() {}
+
+func (x *StreamPlaybackRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_internal_control_control_proto_msgTypes[4]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use StreamPlaybackRequest.ProtoReflect.Descriptor instead.
+func (*StreamPlaybackRequest) Descriptor() ([]byte, []int) {
+	return file_internal_control_control_proto_rawDescGZIP(), []int{4}
+}
+
+func (x *StreamPlaybackRequest) GetSessionId() string {
+	if x != nil {
+		return x.SessionId
+	}
+	return ""
+}
+
+func (x *StreamPlaybackRequest) GetAudioId() string {
+	if x != nil {
+		return x.AudioId
+	}
+	return ""
+}
+
+func (x *StreamPlaybackRequest) GetAudioPath() string {
+	if x != nil {
+		return x.AudioPath
+	}
+	return ""
+}
+
+func (x *StreamPlaybackRequest) GetSharedAtNanos() int64 {
+	if x != nil {
+		return x.SharedAtNanos
+	}
+	return 0
+}
+
+func (x *StreamPlaybackRequest) GetRelay() bool {
+	if x != nil {
+		return x.Relay
+	}
+	return false
+}
+
+type StreamPlaybackResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Accepted      bool                   `protobuf:"varint,1,opt,name=accepted,proto3" json:"accepted,omitempty"`
+	SessionId     string                 `protobuf:"bytes,2,opt,name=session_id,json=sessionId,proto3" json:"session_id,omitempty"`
+	Message       string                 `protobuf:"bytes,3,opt,name=message,proto3" json:"message,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *StreamPlaybackResponse) Reset() {
+	*x = StreamPlaybackResponse{}
+	mi := &file_internal_control_control_proto_msgTypes[5]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *StreamPlaybackResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*StreamPlaybackResponse) ProtoMessage() {}
+
+func (x *StreamPlaybackResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_internal_control_control_proto_msgTypes[5]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use StreamPlaybackResponse.ProtoReflect.Descriptor instead.
+func (*StreamPlaybackResponse) Descriptor() ([]byte, []int) {
+	return file_internal_control_control_proto_rawDescGZIP(), []int{5}
+}
+
+func (x *StreamPlaybackResponse) GetAccepted() bool {
+	if x != nil {
+		return x.Accepted
+	}
+	return false
+}
+
+func (x *StreamPlaybackResponse) GetSessionId() string {
+	if x != nil {
+		return x.SessionId
+	}
+	return ""
+}
+
+func (x *StreamPlaybackResponse) GetMessage() string {
+	if x != nil {
+		return x.Message
+	}
+	return ""
+}
+
+type AudioChunk struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	SessionId     string                 `protobuf:"bytes,1,opt,name=session_id,json=sessionId,proto3" json:"session_id,omitempty"`
+	AudioId       string                 `protobuf:"bytes,2,opt,name=audio_id,json=audioId,proto3" json:"audio_id,omitempty"`
+	Sequence      int64                  `protobuf:"varint,3,opt,name=sequence,proto3" json:"sequence,omitempty"`
+	Data          []byte                 `protobuf:"bytes,4,opt,name=data,proto3" json:"data,omitempty"`
+	EndOfStream   bool                   `protobuf:"varint,5,opt,name=end_of_stream,json=endOfStream,proto3" json:"end_of_stream,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *AudioChunk) Reset() {
+	*x = AudioChunk{}
+	mi := &file_internal_control_control_proto_msgTypes[6]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *AudioChunk) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*AudioChunk) ProtoMessage() {}
+
+func (x *AudioChunk) ProtoReflect() protoreflect.Message {
+	mi := &file_internal_control_control_proto_msgTypes[6]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use AudioChunk.ProtoReflect.Descriptor instead.
+func (*AudioChunk) Descriptor() ([]byte, []int) {
+	return file_internal_control_control_proto_rawDescGZIP(), []int{6}
+}
+
+func (x *AudioChunk) GetSessionId() string {
+	if x != nil {
+		return x.SessionId
+	}
+	return ""
+}
+
+func (x *AudioChunk) GetAudioId() string {
+	if x != nil {
+		return x.AudioId
+	}
+	return ""
+}
+
+func (x *AudioChunk) GetSequence() int64 {
+	if x != nil {
+		return x.Sequence
+	}
+	return 0
+}
+
+func (x *AudioChunk) GetData() []byte {
+	if x != nil {
+		return x.Data
+	}
+	return nil
+}
+
+func (x *AudioChunk) GetEndOfStream() bool {
+	if x != nil {
+		return x.EndOfStream
+	}
+	return false
+}
+
 var File_internal_control_control_proto protoreflect.FileDescriptor
 
 const file_internal_control_control_proto_rawDesc = "" +
@@ -265,10 +477,33 @@ const file_internal_control_control_proto_rawDesc = "" +
 	"audio_path\x18\x02 \x01(\tR\taudioPath\x12&\n" +
 	"\x0fshared_at_nanos\x18\x03 \x01(\x03R\rsharedAtNanos\")\n" +
 	"\vPlaybackAck\x12\x1a\n" +
-	"\baccepted\x18\x01 \x01(\bR\baccepted2\x95\x01\n" +
+	"\baccepted\x18\x01 \x01(\bR\baccepted\"\xae\x01\n" +
+	"\x15StreamPlaybackRequest\x12\x1d\n" +
+	"\n" +
+	"session_id\x18\x01 \x01(\tR\tsessionId\x12\x19\n" +
+	"\baudio_id\x18\x02 \x01(\tR\aaudioId\x12\x1d\n" +
+	"\n" +
+	"audio_path\x18\x03 \x01(\tR\taudioPath\x12&\n" +
+	"\x0fshared_at_nanos\x18\x04 \x01(\x03R\rsharedAtNanos\x12\x14\n" +
+	"\x05relay\x18\x05 \x01(\bR\x05relay\"m\n" +
+	"\x16StreamPlaybackResponse\x12\x1a\n" +
+	"\baccepted\x18\x01 \x01(\bR\baccepted\x12\x1d\n" +
+	"\n" +
+	"session_id\x18\x02 \x01(\tR\tsessionId\x12\x18\n" +
+	"\amessage\x18\x03 \x01(\tR\amessage\"\x9a\x01\n" +
+	"\n" +
+	"AudioChunk\x12\x1d\n" +
+	"\n" +
+	"session_id\x18\x01 \x01(\tR\tsessionId\x12\x19\n" +
+	"\baudio_id\x18\x02 \x01(\tR\aaudioId\x12\x1a\n" +
+	"\bsequence\x18\x03 \x01(\x03R\bsequence\x12\x12\n" +
+	"\x04data\x18\x04 \x01(\fR\x04data\x12\"\n" +
+	"\rend_of_stream\x18\x05 \x01(\bR\vendOfStream2\xb3\x02\n" +
 	"\vPeerControl\x12D\n" +
 	"\rStartPlayback\x12\x18.control.PlaybackRequest\x1a\x19.control.PlaybackResponse\x12@\n" +
-	"\x0eNotifyPlayback\x12\x18.control.PlaybackCommand\x1a\x14.control.PlaybackAckB\x19Z\x17silent/internal/controlb\x06proto3"
+	"\x0eNotifyPlayback\x12\x18.control.PlaybackCommand\x1a\x14.control.PlaybackAck\x12V\n" +
+	"\x13StartStreamPlayback\x12\x1e.control.StreamPlaybackRequest\x1a\x1f.control.StreamPlaybackResponse\x12D\n" +
+	"\vStreamAudio\x12\x1e.control.StreamPlaybackRequest\x1a\x13.control.AudioChunk0\x01B\x19Z\x17silent/internal/controlb\x06proto3"
 
 var (
 	file_internal_control_control_proto_rawDescOnce sync.Once
@@ -282,20 +517,27 @@ func file_internal_control_control_proto_rawDescGZIP() []byte {
 	return file_internal_control_control_proto_rawDescData
 }
 
-var file_internal_control_control_proto_msgTypes = make([]protoimpl.MessageInfo, 4)
+var file_internal_control_control_proto_msgTypes = make([]protoimpl.MessageInfo, 7)
 var file_internal_control_control_proto_goTypes = []any{
-	(*PlaybackRequest)(nil),  // 0: control.PlaybackRequest
-	(*PlaybackResponse)(nil), // 1: control.PlaybackResponse
-	(*PlaybackCommand)(nil),  // 2: control.PlaybackCommand
-	(*PlaybackAck)(nil),      // 3: control.PlaybackAck
+	(*PlaybackRequest)(nil),        // 0: control.PlaybackRequest
+	(*PlaybackResponse)(nil),       // 1: control.PlaybackResponse
+	(*PlaybackCommand)(nil),        // 2: control.PlaybackCommand
+	(*PlaybackAck)(nil),            // 3: control.PlaybackAck
+	(*StreamPlaybackRequest)(nil),  // 4: control.StreamPlaybackRequest
+	(*StreamPlaybackResponse)(nil), // 5: control.StreamPlaybackResponse
+	(*AudioChunk)(nil),             // 6: control.AudioChunk
 }
 var file_internal_control_control_proto_depIdxs = []int32{
 	0, // 0: control.PeerControl.StartPlayback:input_type -> control.PlaybackRequest
 	2, // 1: control.PeerControl.NotifyPlayback:input_type -> control.PlaybackCommand
-	1, // 2: control.PeerControl.StartPlayback:output_type -> control.PlaybackResponse
-	3, // 3: control.PeerControl.NotifyPlayback:output_type -> control.PlaybackAck
-	2, // [2:4] is the sub-list for method output_type
-	0, // [0:2] is the sub-list for method input_type
+	4, // 2: control.PeerControl.StartStreamPlayback:input_type -> control.StreamPlaybackRequest
+	4, // 3: control.PeerControl.StreamAudio:input_type -> control.StreamPlaybackRequest
+	1, // 4: control.PeerControl.StartPlayback:output_type -> control.PlaybackResponse
+	3, // 5: control.PeerControl.NotifyPlayback:output_type -> control.PlaybackAck
+	5, // 6: control.PeerControl.StartStreamPlayback:output_type -> control.StreamPlaybackResponse
+	6, // 7: control.PeerControl.StreamAudio:output_type -> control.AudioChunk
+	4, // [4:8] is the sub-list for method output_type
+	0, // [0:4] is the sub-list for method input_type
 	0, // [0:0] is the sub-list for extension type_name
 	0, // [0:0] is the sub-list for extension extendee
 	0, // [0:0] is the sub-list for field type_name
@@ -312,7 +554,7 @@ func file_internal_control_control_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_internal_control_control_proto_rawDesc), len(file_internal_control_control_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   4,
+			NumMessages:   7,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

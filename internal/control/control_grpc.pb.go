@@ -19,8 +19,10 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	PeerControl_StartPlayback_FullMethodName  = "/control.PeerControl/StartPlayback"
-	PeerControl_NotifyPlayback_FullMethodName = "/control.PeerControl/NotifyPlayback"
+	PeerControl_StartPlayback_FullMethodName       = "/control.PeerControl/StartPlayback"
+	PeerControl_NotifyPlayback_FullMethodName      = "/control.PeerControl/NotifyPlayback"
+	PeerControl_StartStreamPlayback_FullMethodName = "/control.PeerControl/StartStreamPlayback"
+	PeerControl_StreamAudio_FullMethodName         = "/control.PeerControl/StreamAudio"
 )
 
 // PeerControlClient is the client API for PeerControl service.
@@ -29,6 +31,8 @@ const (
 type PeerControlClient interface {
 	StartPlayback(ctx context.Context, in *PlaybackRequest, opts ...grpc.CallOption) (*PlaybackResponse, error)
 	NotifyPlayback(ctx context.Context, in *PlaybackCommand, opts ...grpc.CallOption) (*PlaybackAck, error)
+	StartStreamPlayback(ctx context.Context, in *StreamPlaybackRequest, opts ...grpc.CallOption) (*StreamPlaybackResponse, error)
+	StreamAudio(ctx context.Context, in *StreamPlaybackRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[AudioChunk], error)
 }
 
 type peerControlClient struct {
@@ -59,12 +63,43 @@ func (c *peerControlClient) NotifyPlayback(ctx context.Context, in *PlaybackComm
 	return out, nil
 }
 
+func (c *peerControlClient) StartStreamPlayback(ctx context.Context, in *StreamPlaybackRequest, opts ...grpc.CallOption) (*StreamPlaybackResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(StreamPlaybackResponse)
+	err := c.cc.Invoke(ctx, PeerControl_StartStreamPlayback_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *peerControlClient) StreamAudio(ctx context.Context, in *StreamPlaybackRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[AudioChunk], error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	stream, err := c.cc.NewStream(ctx, &PeerControl_ServiceDesc.Streams[0], PeerControl_StreamAudio_FullMethodName, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &grpc.GenericClientStream[StreamPlaybackRequest, AudioChunk]{ClientStream: stream}
+	if err := x.ClientStream.SendMsg(in); err != nil {
+		return nil, err
+	}
+	if err := x.ClientStream.CloseSend(); err != nil {
+		return nil, err
+	}
+	return x, nil
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type PeerControl_StreamAudioClient = grpc.ServerStreamingClient[AudioChunk]
+
 // PeerControlServer is the server API for PeerControl service.
 // All implementations must embed UnimplementedPeerControlServer
 // for forward compatibility.
 type PeerControlServer interface {
 	StartPlayback(context.Context, *PlaybackRequest) (*PlaybackResponse, error)
 	NotifyPlayback(context.Context, *PlaybackCommand) (*PlaybackAck, error)
+	StartStreamPlayback(context.Context, *StreamPlaybackRequest) (*StreamPlaybackResponse, error)
+	StreamAudio(*StreamPlaybackRequest, grpc.ServerStreamingServer[AudioChunk]) error
 	mustEmbedUnimplementedPeerControlServer()
 }
 
@@ -80,6 +115,12 @@ func (UnimplementedPeerControlServer) StartPlayback(context.Context, *PlaybackRe
 }
 func (UnimplementedPeerControlServer) NotifyPlayback(context.Context, *PlaybackCommand) (*PlaybackAck, error) {
 	return nil, status.Error(codes.Unimplemented, "method NotifyPlayback not implemented")
+}
+func (UnimplementedPeerControlServer) StartStreamPlayback(context.Context, *StreamPlaybackRequest) (*StreamPlaybackResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method StartStreamPlayback not implemented")
+}
+func (UnimplementedPeerControlServer) StreamAudio(*StreamPlaybackRequest, grpc.ServerStreamingServer[AudioChunk]) error {
+	return status.Error(codes.Unimplemented, "method StreamAudio not implemented")
 }
 func (UnimplementedPeerControlServer) mustEmbedUnimplementedPeerControlServer() {}
 func (UnimplementedPeerControlServer) testEmbeddedByValue()                     {}
@@ -138,6 +179,35 @@ func _PeerControl_NotifyPlayback_Handler(srv interface{}, ctx context.Context, d
 	return interceptor(ctx, in, info, handler)
 }
 
+func _PeerControl_StartStreamPlayback_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(StreamPlaybackRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(PeerControlServer).StartStreamPlayback(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: PeerControl_StartStreamPlayback_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(PeerControlServer).StartStreamPlayback(ctx, req.(*StreamPlaybackRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _PeerControl_StreamAudio_Handler(srv interface{}, stream grpc.ServerStream) error {
+	m := new(StreamPlaybackRequest)
+	if err := stream.RecvMsg(m); err != nil {
+		return err
+	}
+	return srv.(PeerControlServer).StreamAudio(m, &grpc.GenericServerStream[StreamPlaybackRequest, AudioChunk]{ServerStream: stream})
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type PeerControl_StreamAudioServer = grpc.ServerStreamingServer[AudioChunk]
+
 // PeerControl_ServiceDesc is the grpc.ServiceDesc for PeerControl service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -153,7 +223,17 @@ var PeerControl_ServiceDesc = grpc.ServiceDesc{
 			MethodName: "NotifyPlayback",
 			Handler:    _PeerControl_NotifyPlayback_Handler,
 		},
+		{
+			MethodName: "StartStreamPlayback",
+			Handler:    _PeerControl_StartStreamPlayback_Handler,
+		},
 	},
-	Streams:  []grpc.StreamDesc{},
+	Streams: []grpc.StreamDesc{
+		{
+			StreamName:    "StreamAudio",
+			Handler:       _PeerControl_StreamAudio_Handler,
+			ServerStreams: true,
+		},
+	},
 	Metadata: "internal/control/control.proto",
 }

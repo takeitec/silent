@@ -1,6 +1,6 @@
 FROM golang:1.26-alpine AS build
 WORKDIR /src
-COPY go.mod ./
+COPY go.mod go.sum ./
 COPY internal ./internal
 COPY cmd ./cmd
 RUN go build -o /out/peer ./cmd/peer
