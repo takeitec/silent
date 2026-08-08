@@ -1,31 +1,44 @@
 package main
 
 import (
-	"context"
 	"flag"
 	"fmt"
 	"log"
 	"net"
 	"os"
-	"os/exec"
 	"os/signal"
-	"runtime"
-	"strconv"
-	"strings"
 	"syscall"
 	"time"
 
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
-
-	"silent/internal/control"
 	"silent/internal/discovery"
 	"silent/internal/models"
 	"silent/internal/peerlist"
-	"silent/internal/sync"
 )
 
+type config struct {
+	id          string
+	broadcastIP string
+	port        int
+	controlPort int
+	grpcPort    int
+	leader      bool
+	wavPath     string
+}
+
 func main() {
+	cfg := parseFlags()
+
+	app, err := newPeerApp(cfg)
+	if err != nil {
+		log.Fatalf("create peer app: %v", err)
+	}
+
+	if err := app.Run(); err != nil {
+		log.Fatalf("peer app: %v", err)
+	}
+}
+
+func parseFlags() config {
 	id := flag.String("id", "peer-1", "node identifier")
 	broadcastIP := flag.String("broadcast-ip", "255.255.255.255", "broadcast address for peer discovery/scheduling")
 	port := flag.Int("port", 9999, "UDP discovery port")
@@ -35,18 +48,40 @@ func main() {
 	wavPath := flag.String("wav", "", "optional wav file to play")
 	flag.Parse()
 
-	broadcastAddr, err := validateBroadcastIP(*broadcastIP)
+	return config{
+		id:          *id,
+		broadcastIP: *broadcastIP,
+		port:        *port,
+		controlPort: *controlPortFlag,
+		grpcPort:    *grpcPort,
+		leader:      *leader,
+		wavPath:     *wavPath,
+	}
+}
+
+type peerApp struct {
+	cfg        config
+	pl         *peerlist.PeerList
+	ann        *discovery.Announcer
+	listener   *net.UDPConn
+	offsetCh   chan time.Duration
+	grpcServer *peerControlServer
+}
+
+func newPeerApp(cfg config) (*peerApp, error) {
+	broadcastAddr, err := validateBroadcastIP(cfg.broadcastIP)
 	if err != nil {
-		log.Fatalf("invalid broadcast IP: %v", err)
+		return nil, err
 	}
 
 	pl := peerlist.New()
 	ann := discovery.NewAnnouncer(discovery.Config{
-		ID:          *id,
-		Port:        *port,
-		Leader:      *leader,
+		ID:          cfg.id,
+		Port:        cfg.port,
+		Leader:      cfg.leader,
 		BroadcastIP: broadcastAddr,
 	})
+
 	ann.SetSeenCallback(func(p models.Peer) {
 		host := p.Address
 		if h, _, err := net.SplitHostPort(p.Address); err == nil {
@@ -56,20 +91,44 @@ func main() {
 		log.Printf("discovered peer %s (%s) role=%s", p.ID, host, p.Role)
 	})
 
-	controlPort := *controlPortFlag
+	controlPort := cfg.controlPort
 	if controlPort == 0 {
-		controlPort = *port + 1
+		controlPort = cfg.port + 1
 	}
-	listener, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.ParseIP("0.0.0.0"), Port: controlPort})
+
+	listener, err := net.ListenUDP("udp4", &net.UDPAddr{
+		IP:   net.ParseIP("0.0.0.0"),
+		Port: controlPort,
+	})
 	if err != nil {
-		log.Fatalf("listen on control port: %v", err)
+		return nil, err
 	}
-	defer listener.Close()
 
 	offsetCh := make(chan time.Duration, 1)
+
+	return &peerApp{
+		cfg:      cfg,
+		pl:       pl,
+		ann:      ann,
+		listener: listener,
+		offsetCh: offsetCh,
+		grpcServer: &peerControlServer{
+			id:       cfg.id,
+			isLeader: cfg.leader,
+			pl:       pl,
+			grpcPort: cfg.grpcPort,
+			wavPath:  cfg.wavPath,
+			offsetCh: offsetCh,
+		},
+	}, nil
+}
+
+func (a *peerApp) Run() error {
+	defer a.listener.Close()
+
 	go func() {
 		for {
-			if err := ann.Announce(); err != nil {
+			if err := a.ann.Announce(); err != nil {
 				log.Printf("announce failed: %v", err)
 			}
 			time.Sleep(1 * time.Second)
@@ -77,376 +136,57 @@ func main() {
 	}()
 
 	go func() {
-		if err := ann.Start(); err != nil {
+		if err := a.ann.Start(); err != nil {
 			log.Printf("discovery stopped: %v", err)
 		}
 	}()
 
 	go func() {
-		if err := handleControl(listener, *leader, *id, *wavPath, offsetCh); err != nil {
+		if err := handleControl(a.listener, a.cfg.leader, a.cfg.id, a.cfg.wavPath, a.offsetCh); err != nil {
 			log.Printf("control loop stopped: %v", err)
 		}
 	}()
 
-	srv := &peerControlServer{
-		id:       *id,
-		isLeader: *leader,
-		pl:       pl,
-		grpcPort: *grpcPort,
-		wavPath:  *wavPath,
-		offsetCh: offsetCh,
-	}
-
 	go func() {
-		if err := startGRPCServer(fmt.Sprintf("0.0.0.0:%d", *grpcPort), srv); err != nil {
+		if err := startGRPCServer(fmt.Sprintf("0.0.0.0:%d", a.cfg.grpcPort), a.grpcServer); err != nil {
 			log.Printf("gRPC server stopped: %v", err)
 		}
 	}()
 
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
-
-	fmt.Printf("peer %s listening on udp:%d (control:%d)\n", *id, *port, controlPort)
-	if *leader {
+	fmt.Printf("peer %s listening on udp:%d (control:%d)\n", a.cfg.id, a.cfg.port, a.cfg.controlPort)
+	if a.cfg.leader {
 		fmt.Println("leader mode enabled")
 		go func() {
 			time.Sleep(2 * time.Second)
 			shared := time.Now().Add(3 * time.Second)
-			if err := broadcastSchedule(controlPort, *id, shared, *wavPath, broadcastAddr); err != nil {
+			if err := broadcastSchedule(a.listener.LocalAddr().(*net.UDPAddr).Port, a.cfg.id, shared, a.cfg.wavPath, "255.255.255.255"); err != nil {
 				log.Printf("broadcast failed: %v", err)
 			}
 			fmt.Printf("leader broadcast shared playback at %s\n", shared.Format(time.RFC3339Nano))
 		}()
 	} else {
 		go func() {
-			log.Printf("follower %s waiting for leader discovery", *id)
-
+			log.Printf("follower %s waiting for leader discovery", a.cfg.id)
 			for {
-				leader := pl.Leader()
+				leader := a.pl.Leader()
 				if leader != nil {
-					log.Printf("follower %s discovered leader %s at %s", *id, leader.ID, leader.Address)
-
-					if err := probeLeader(*leader, *id, controlPort, offsetCh); err != nil {
+					log.Printf("follower %s discovered leader %s at %s", a.cfg.id, leader.ID, leader.Address)
+					if err := probeLeader(*leader, a.cfg.id, a.listener.LocalAddr().(*net.UDPAddr).Port, a.offsetCh); err != nil {
 						log.Printf("clock sync failed: %v", err)
 					}
 				} else {
-					log.Printf("follower %s has not discovered a leader yet", *id)
+					log.Printf("follower %s has not discovered a leader yet", a.cfg.id)
 				}
-
 				time.Sleep(2 * time.Second)
 			}
 		}()
 	}
 
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
 	<-sigCh
-	ann.Stop()
+
+	a.ann.Stop()
 	fmt.Println("shutting down")
-}
-
-func handleControl(listener *net.UDPConn, leader bool, id, wavPath string, offsetCh chan time.Duration) error {
-	buf := make([]byte, 1024)
-	var offset time.Duration
-	for {
-		n, addr, err := listener.ReadFromUDP(buf)
-		recv := time.Now()
-		if err != nil {
-			return err
-		}
-		msg := strings.TrimSpace(string(buf[:n]))
-		parts := strings.Split(msg, "|")
-		if len(parts) == 0 {
-			continue
-		}
-		switch parts[0] {
-		case "SYNC":
-			if !leader {
-				continue
-			}
-			if len(parts) < 2 {
-				continue
-			}
-			_, err := strconv.ParseInt(parts[1], 10, 64)
-			if err != nil {
-				continue
-			}
-			serverSend := time.Now()
-			response := fmt.Sprintf("SYNC-ACK|%d|%d", recv.UnixNano(), serverSend.UnixNano())
-			_, _ = listener.WriteToUDP([]byte(response), addr)
-			fmt.Printf("leader received sync ping from %s\n", addr.String())
-		case "PLAY":
-			if leader || len(parts) < 3 {
-				continue
-			}
-			sharedAtNanos, err := strconv.ParseInt(parts[2], 10, 64)
-			if err != nil {
-				continue
-			}
-			sharedAt := time.Unix(0, sharedAtNanos)
-			select {
-			case currentOffset := <-offsetCh:
-				offset = currentOffset
-			default:
-			}
-			localAt := sync.ConvertSharedTimeToLocal(sharedAt, offset)
-			fmt.Printf("scheduled playback for %s (local %s)\n", sharedAt.Format(time.RFC3339Nano), localAt.Format(time.RFC3339Nano))
-			go schedulePlayback(localAt, wavPath)
-		}
-	}
-}
-
-func probeLeader(peer models.Peer, id string, controlPort int, offsetCh chan time.Duration) error {
-	addr, err := parsePeerAddress(peer.Address, controlPort)
-	if err != nil {
-		return err
-	}
-	conn, err := net.Dial("udp4", addr)
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
-	clientSend := time.Now().UnixNano()
-	_, err = conn.Write([]byte("SYNC|" + strconv.FormatInt(clientSend, 10)))
-	if err != nil {
-		return err
-	}
-	buf := make([]byte, 1024)
-	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
-	n, err := conn.Read(buf)
-	if err != nil {
-		return err
-	}
-	clientRecv := time.Now()
-	parts := strings.Split(strings.TrimSpace(string(buf[:n])), "|")
-	if len(parts) < 3 {
-		return fmt.Errorf("invalid sync response: %q", string(buf[:n]))
-	}
-	serverRecvNanos, _ := strconv.ParseInt(parts[1], 10, 64)
-	serverSendNanos, _ := strconv.ParseInt(parts[2], 10, 64)
-	serverRecv := time.Unix(0, serverRecvNanos)
-	serverSend := time.Unix(0, serverSendNanos)
-	offset := sync.ComputeOffset(time.Unix(0, clientSend), serverRecv, serverSend, clientRecv)
-	select {
-	case offsetCh <- offset:
-	default:
-	}
-	fmt.Printf("%s synced with leader, offset=%s\n", id, offset)
 	return nil
-}
-
-func parsePeerAddress(peer string, controlPort int) (string, error) {
-	host := strings.TrimSpace(peer)
-
-	if strings.Contains(host, "@") {
-		parts := strings.SplitN(host, "@", 2)
-		if len(parts) != 2 || strings.TrimSpace(parts[1]) == "" {
-			return "", fmt.Errorf("invalid peer address %q", peer)
-		}
-		host = strings.TrimSpace(parts[1])
-	}
-
-	if h, _, err := net.SplitHostPort(host); err == nil {
-		host = h
-	}
-
-	if host == "" {
-		return "", fmt.Errorf("invalid peer address %q", peer)
-	}
-
-	return net.JoinHostPort(host, strconv.Itoa(controlPort)), nil
-}
-
-func validateBroadcastIP(raw string) (string, error) {
-	raw = strings.TrimSpace(raw)
-	if raw == "" {
-		return "", fmt.Errorf("broadcast IP cannot be empty")
-	}
-
-	ip := net.ParseIP(raw)
-	if ip == nil {
-		return "", fmt.Errorf("invalid broadcast IP %q: must be a valid IP address", raw)
-	}
-
-	if ip.To4() == nil {
-		return "", fmt.Errorf("invalid broadcast IP %q: IPv6 is not supported here", raw)
-	}
-
-	if ip.IsLoopback() || ip.IsUnspecified() {
-		return "", fmt.Errorf("invalid broadcast IP %q: use a real broadcast address such as 192.168.1.255", raw)
-	}
-
-	if strings.Count(raw, ".") != 3 {
-		return "", fmt.Errorf("invalid broadcast IP %q: expected an IPv4 address", raw)
-	}
-
-	return ip.String(), nil
-}
-
-func broadcastSchedule(controlPort int, id string, shared time.Time, wavPath, broadcastAddr string) error {
-	conn, err := net.DialUDP("udp4", nil, &net.UDPAddr{IP: net.ParseIP(broadcastAddr), Port: controlPort})
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
-
-	// if err := discovery.EnableBroadcast(conn); err != nil {
-	// 	return err
-	// }
-
-	msg := fmt.Sprintf("PLAY|%s|%d", id, shared.UnixNano())
-	log.Printf("main: sending PLAY to %s:%d -> %s", broadcastAddr, controlPort, msg)
-
-	_, err = conn.Write([]byte(msg))
-	return err
-}
-
-func schedulePlayback(at time.Time, wavPath string) {
-	delay := time.Until(at)
-	if delay > 0 {
-		time.Sleep(delay)
-	}
-	if wavPath != "" {
-		if runtime.GOOS == "windows" {
-			log.Printf("playback: Windows host detected; skipping external audio player")
-			fmt.Print("\a")
-			return
-		}
-		if _, err := exec.LookPath("aplay"); err == nil {
-			cmd := exec.Command("aplay", wavPath)
-			if err := cmd.Start(); err != nil {
-				log.Printf("playback failed: %v", err)
-			}
-			return
-		}
-		if _, err := exec.LookPath("ffplay"); err == nil {
-			cmd := exec.Command("ffplay", "-nodisp", "-autoexit", wavPath)
-			if err := cmd.Start(); err != nil {
-				log.Printf("playback failed: %v", err)
-			}
-			return
-		}
-		log.Printf("no audio player available for %s", wavPath)
-		return
-	}
-	fmt.Print("\a")
-}
-
-type peerControlServer struct {
-	control.UnimplementedPeerControlServer
-
-	id       string
-	isLeader bool
-	pl       *peerlist.PeerList
-	grpcPort int
-	wavPath  string
-	offsetCh chan time.Duration
-}
-
-func hostFromAddress(addr string) string {
-	host := strings.TrimSpace(addr)
-
-	if strings.Contains(host, "@") {
-		parts := strings.SplitN(host, "@", 2)
-		if len(parts) == 2 && strings.TrimSpace(parts[1]) != "" {
-			host = strings.TrimSpace(parts[1])
-		}
-	}
-
-	if h, _, err := net.SplitHostPort(host); err == nil {
-		return h
-	}
-
-	return host
-}
-
-func (s *peerControlServer) StartPlayback(ctx context.Context, req *control.PlaybackRequest) (*control.PlaybackResponse, error) {
-	log.Printf("gRPC: StartPlayback received audio_id=%q audio_path=%q", req.AudioId, req.AudioPath)
-
-	if !s.isLeader {
-		log.Printf("gRPC: StartPlayback rejected because this peer is not the leader")
-		return &control.PlaybackResponse{Accepted: false, Message: "not leader"}, nil
-	}
-
-	sharedAt := time.Now().Add(3 * time.Second)
-	peers := s.pl.Peers()
-	log.Printf("gRPC: leader will notify %d follower(s) at shared time %s", len(peers), sharedAt.Format(time.RFC3339Nano))
-
-	for _, p := range peers {
-		if p.ID == s.id || p.Role == models.RoleLeader {
-			continue
-		}
-
-		target := fmt.Sprintf("%s:%d", hostFromAddress(p.Address), s.grpcPort)
-		log.Printf("gRPC: notifying peer %s at %s", p.ID, target)
-
-		conn, err := grpc.NewClient(target, grpc.WithTransportCredentials(insecure.NewCredentials()))
-		if err != nil {
-			log.Printf("gRPC: notify %s failed to connect: %v", p.ID, err)
-			continue
-		}
-
-		client := control.NewPeerControlClient(conn)
-		_, err = client.NotifyPlayback(ctx, &control.PlaybackCommand{
-			AudioId:       req.AudioId,
-			AudioPath:     req.AudioPath,
-			SharedAtNanos: sharedAt.UnixNano(),
-		})
-		conn.Close()
-
-		if err != nil {
-			log.Printf("gRPC: notify playback to %s failed: %v", p.ID, err)
-			continue
-		}
-
-		log.Printf("gRPC: notify playback to %s succeeded", p.ID)
-	}
-
-	return &control.PlaybackResponse{Accepted: true, Message: "playback started"}, nil
-}
-
-func (s *peerControlServer) NotifyPlayback(ctx context.Context, req *control.PlaybackCommand) (*control.PlaybackAck, error) {
-	sharedAt := time.Unix(0, req.SharedAtNanos)
-	var offset time.Duration
-
-	select {
-	case currentOffset := <-s.offsetCh:
-		offset = currentOffset
-	default:
-	}
-
-	localAt := sync.ConvertSharedTimeToLocal(sharedAt, offset)
-
-	log.Printf("received playback command for %s at local %s", req.AudioId, localAt.Format(time.RFC3339Nano))
-
-	go schedulePlayback(localAt, req.AudioPath)
-
-	return &control.PlaybackAck{Accepted: true}, nil
-}
-
-func startGRPCServer(addr string, srv *peerControlServer) error {
-	lis, err := net.Listen("tcp", addr)
-	if err != nil {
-		return err
-	}
-
-	gs := grpc.NewServer()
-	control.RegisterPeerControlServer(gs, srv)
-
-	log.Printf("gRPC server listening on %s", addr)
-
-	return gs.Serve(lis)
-}
-
-func triggerPlaybackOnLeader(addr string) error {
-	conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
-
-	client := control.NewPeerControlClient(conn)
-	_, err = client.StartPlayback(context.Background(), &control.PlaybackRequest{
-		AudioId:   "demo",
-		AudioPath: "demo.wav",
-	})
-	return err
 }
