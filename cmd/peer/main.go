@@ -45,7 +45,7 @@ func parseFlags() config {
 	id := flag.String("id", "peer-1", "node identifier")
 	broadcastIP := flag.String("broadcast-ip", "255.255.255.255", "broadcast address for peer discovery/scheduling")
 	port := flag.Int("port", 9999, "UDP discovery port")
-	controlPortFlag := flag.Int("control-port", 0, "UDP control port")
+	controlPortFlag := flag.Int("control-port", 10000, "UDP control port")
 	grpcPort := flag.Int("grpc-port", 50051, "gRPC control port")
 	leader := flag.Bool("leader", false, "act as the leader for scheduling")
 	wavPath := flag.String("wav", "", "optional wav file to play")
@@ -110,6 +110,7 @@ func newPeerApp(cfg config) (*peerApp, error) {
 	if err != nil {
 		return nil, err
 	}
+	log.Printf("peer %s listening for control on udp:%d", cfg.id, controlPort)
 
 	offsetCh := make(chan time.Duration, 1)
 
@@ -141,16 +142,13 @@ func effectiveControlPort(cfg config) int {
 	if cfg.controlPort > 0 {
 		return cfg.controlPort
 	}
-	if cfg.room && cfg.port > 0 {
-		return cfg.port
-	}
 	if cfg.port > 0 {
 		return cfg.port + 1
 	}
 	return 0
 }
 
-func peerControlPort(peer models.Peer, fallback int) int {
+func probePortForLeader(peer models.Peer, fallback int) int {
 	if peer.ControlPort > 0 {
 		return peer.ControlPort
 	}
@@ -233,9 +231,8 @@ func (a *peerApp) Run() error {
 			}
 		}()
 	}
-	if !a.cfg.room {
-		fmt.Printf("peer %s listening on udp:%d (control:%d)\n", a.cfg.id, a.cfg.port, a.cfg.controlPort)
-	}
+
+	fmt.Printf("peer %s listening on udp:%d (control:%d)\n", a.cfg.id, a.cfg.port, effectiveControlPort(a.cfg))
 
 	go func() {
 		if a.cfg.leader {
@@ -255,7 +252,7 @@ func (a *peerApp) Run() error {
 			}
 
 			log.Printf("follower %s discovered leader %s at %s", a.cfg.id, leader.ID, leader.Address)
-			if err := probeLeader(*leader, a.cfg.id, peerControlPort(*leader, effectiveControlPort(a.cfg)), a.offsetCh); err != nil {
+			if err := probeLeader(*leader, a.cfg.id, probePortForLeader(*leader, effectiveControlPort(a.cfg)), a.offsetCh); err != nil {
 				log.Printf("clock sync failed: %v", err)
 			}
 		}

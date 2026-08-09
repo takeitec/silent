@@ -61,10 +61,10 @@ func TestShouldProbeLeaderAllowsFollowerToProbe(t *testing.T) {
 	}
 }
 
-func TestEffectiveControlPortUsesSharedPortInRoomMode(t *testing.T) {
+func TestEffectiveControlPortUsesPortPlusOneInRoomMode(t *testing.T) {
 	cfg := config{port: 9999, room: true}
-	if got := effectiveControlPort(cfg); got != 9999 {
-		t.Fatalf("expected shared control port 9999 in room mode, got %d", got)
+	if got := effectiveControlPort(cfg); got != 10000 {
+		t.Fatalf("expected default control port 10000 in room mode, got %d", got)
 	}
 }
 
@@ -75,16 +75,23 @@ func TestEffectiveControlPortUsesPortPlusOneOutsideRoomMode(t *testing.T) {
 	}
 }
 
-func TestPeerControlPortPrefersExplicitControlPort(t *testing.T) {
-	peer := models.Peer{Address: "192.0.2.10:50051", ControlPort: 10000}
-	if got := peerControlPort(peer, 10001); got != 10000 {
-		t.Fatalf("expected explicit control port 10000, got %d", got)
+func TestProbePortForLeaderUsesDiscoveredControlPort(t *testing.T) {
+	peer := models.Peer{ControlPort: 9999}
+	if got := probePortForLeader(peer, 10001); got != 9999 {
+		t.Fatalf("expected discovered control port 9999, got %d", got)
 	}
 }
 
-func TestPeerControlPortFallsBackToConfiguredPort(t *testing.T) {
-	peer := models.Peer{Address: "192.0.2.10:10000"}
-	if got := peerControlPort(peer, 10001); got != 10001 {
+func TestProbePortForLeaderFallsBackToConfiguredPort(t *testing.T) {
+	peer := models.Peer{}
+	if got := probePortForLeader(peer, 10001); got != 10001 {
 		t.Fatalf("expected fallback control port 10001, got %d", got)
+	}
+}
+
+func TestEffectiveControlPortUsesPortPlusOne(t *testing.T) {
+	cfg := config{port: 9999}
+	if got := effectiveControlPort(cfg); got != 10000 {
+		t.Fatalf("expected default control port 10000, got %d", got)
 	}
 }
