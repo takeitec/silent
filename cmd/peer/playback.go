@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"io"
 	"log"
 	"os/exec"
 	"runtime"
@@ -42,4 +43,32 @@ func schedulePlayback(at time.Time, wavPath string) {
 	}
 
 	fmt.Print("\a")
+}
+
+func startStreamingPlayback() (io.WriteCloser, func() error, error) {
+	if runtime.GOOS == "windows" {
+		return nil, nil, fmt.Errorf("streaming playback via pipe is not supported on windows host")
+	}
+
+	if _, err := exec.LookPath("ffplay"); err != nil {
+		return nil, nil, fmt.Errorf("ffplay is not available")
+	}
+
+	cmd := exec.Command("ffplay", "-nodisp", "-autoexit", "-loglevel", "error", "-i", "pipe:0")
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		return nil, nil, fmt.Errorf("create ffplay stdin pipe: %w", err)
+	}
+
+	if err := cmd.Start(); err != nil {
+		_ = stdin.Close()
+		return nil, nil, fmt.Errorf("start ffplay: %w", err)
+	}
+
+	closeAndWait := func() error {
+		_ = stdin.Close()
+		return cmd.Wait()
+	}
+
+	return stdin, closeAndWait, nil
 }

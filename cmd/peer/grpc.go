@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -196,6 +197,7 @@ func (s *peerControlServer) StartStreamPlayback(ctx context.Context, req *contro
 	if !s.isLeader {
 		target := s.leaderTarget()
 		if target == "" {
+			s.finishSession(req.SessionId)
 			log.Printf("gRPC stream: follower has no reachable leader target for session=%q", req.SessionId)
 			return &control.StreamPlaybackResponse{
 				Accepted: false,
@@ -204,13 +206,13 @@ func (s *peerControlServer) StartStreamPlayback(ctx context.Context, req *contro
 		}
 		sharedAt := time.Unix(0, req.SharedAtNanos)
 
-		if err := s.receiveAudioFromLeader(ctx, target, req.SessionId, req.AudioId, req.AudioPath, sharedAt); err != nil {
-			log.Printf("gRPC stream: follower failed to receive session=%q from leader: %v", req.SessionId, err)
-			return &control.StreamPlaybackResponse{
-				Accepted: false,
-				Message:  err.Error(),
-			}, nil
-		}
+		go func() {
+			defer s.finishSession(req.SessionId)
+			log.Printf("gRPC stream: follower starting async receive session=%q target=%s at=%s", req.SessionId, target, time.Now().Format(time.RFC3339Nano))
+			if err := s.receiveAudioFromLeader(context.Background(), target, req.SessionId, req.AudioId, req.AudioPath, sharedAt); err != nil {
+				log.Printf("gRPC stream: follower failed to receive session=%q from leader: %v", req.SessionId, err)
+			}
+		}()
 
 		return &control.StreamPlaybackResponse{
 			Accepted:  true,
@@ -222,38 +224,63 @@ func (s *peerControlServer) StartStreamPlayback(ctx context.Context, req *contro
 	// Leader path: tell each follower to connect to the leader and receive the stream.
 	peers := s.pl.Peers()
 	log.Printf("gRPC stream: leader starting stream session=%q for %d follower(s)", req.SessionId, len(peers))
+	var kickoffWG stdsync.WaitGroup
+	kickoffCount := 0
 
 	for _, p := range peers {
 		if p.ID == s.id || p.Role == models.RoleLeader {
 			continue
 		}
 
-		target := peerTarget(p.Address, s.grpcPort)
-		if target == "" {
-			continue
-		}
-		if target == fmt.Sprintf("127.0.0.1:%d", s.grpcPort) || target == fmt.Sprintf("localhost:%d", s.grpcPort) {
-			log.Printf("gRPC stream: skipping self-targeted follower=%s at %s", p.ID, target)
-			continue
-		}
-		log.Printf("gRPC stream: leader telling follower=%s to receive from leader session=%q target=%s", p.ID, req.SessionId, target)
+		follower := p
+		kickoffCount++
+		kickoffWG.Add(1)
+		go func() {
+			defer kickoffWG.Done()
+			target := peerTarget(follower.Address, s.grpcPort)
+			if target == "" {
+				return
+			}
+			if target == fmt.Sprintf("127.0.0.1:%d", s.grpcPort) || target == fmt.Sprintf("localhost:%d", s.grpcPort) {
+				log.Printf("gRPC stream: skipping self-targeted follower=%s at %s", follower.ID, target)
+				return
+			}
+			kickoffAt := time.Now()
+			log.Printf("gRPC stream: leader kickoff follower=%s session=%q target=%s at=%s", follower.ID, req.SessionId, target, kickoffAt.Format(time.RFC3339Nano))
 
-		conn, err := grpc.NewClient(target, grpc.WithTransportCredentials(insecure.NewCredentials()))
-		if err != nil {
-			log.Printf("gRPC stream: failed to contact follower=%s: %v", p.ID, err)
-			continue
-		}
+			conn, err := grpc.NewClient(target, grpc.WithTransportCredentials(insecure.NewCredentials()))
+			if err != nil {
+				log.Printf("gRPC stream: failed to contact follower=%s: %v", follower.ID, err)
+				return
+			}
+			defer conn.Close()
 
-		client := control.NewPeerControlClient(conn)
-		_, err = client.StartStreamPlayback(ctx, req)
-		conn.Close()
+			client := control.NewPeerControlClient(conn)
+			rpcCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
 
-		if err != nil {
-			log.Printf("gRPC stream: follower=%s rejected stream start: %v", p.ID, err)
-			continue
-		}
+			if _, err := client.StartStreamPlayback(rpcCtx, req); err != nil {
+				log.Printf("gRPC stream: follower=%s rejected stream start: %v", follower.ID, err)
+				return
+			}
 
-		log.Printf("gRPC stream: follower=%s accepted stream start session=%q target=%s", p.ID, req.SessionId, target)
+			log.Printf("gRPC stream: follower=%s accepted stream start session=%q target=%s ack_after=%s", follower.ID, req.SessionId, target, time.Since(kickoffAt))
+		}()
+	}
+
+	if kickoffCount == 0 {
+		go func(sessionID string) {
+			time.Sleep(leaderSessionReleaseCooldown)
+			s.finishSession(sessionID)
+			log.Printf("gRPC stream: leader released session=%q after cooldown=%s (no followers)", sessionID, leaderSessionReleaseCooldown)
+		}(req.SessionId)
+	} else {
+		go func(sessionID string, fanoutCount int) {
+			kickoffWG.Wait()
+			time.Sleep(leaderSessionReleaseCooldown)
+			s.finishSession(sessionID)
+			log.Printf("gRPC stream: leader released session=%q after kickoff completion followers=%d cooldown=%s", sessionID, fanoutCount, leaderSessionReleaseCooldown)
+		}(req.SessionId, kickoffCount)
 	}
 
 	return &control.StreamPlaybackResponse{
@@ -264,6 +291,7 @@ func (s *peerControlServer) StartStreamPlayback(ctx context.Context, req *contro
 }
 
 var sessionLease = 30 * time.Second
+var leaderSessionReleaseCooldown = 1500 * time.Millisecond
 
 func (s *peerControlServer) beginSession(sessionID string) bool {
 	s.sessionMu.Lock()
@@ -413,8 +441,17 @@ func (s *peerControlServer) receiveAudioFromLeader(ctx context.Context, target, 
 	}
 
 	localPlaybackAt := syncutil.ConvertSharedTimeToLocal(sharedAt, offset)
+	firstChunkLogged := false
 
 	chunksReceived := 0
+	liveSink, closeLiveSink, liveErr := startStreamingPlayback()
+	if liveErr != nil {
+		log.Printf("gRPC stream: live playback unavailable for session=%q, will use temp file playback: %v", sessionID, liveErr)
+	}
+
+	var liveBuffer bytes.Buffer
+	liveStarted := false
+
 	tempFile, err := os.CreateTemp("", fmt.Sprintf("silent-%s-%s-*.wav", sanitizeForFilename(sessionID), sanitizeForFilename(audioID)))
 	if err != nil {
 		log.Printf("gRPC stream: failed to create output file for session=%q: %v", sessionID, err)
@@ -427,26 +464,96 @@ func (s *peerControlServer) receiveAudioFromLeader(ctx context.Context, target, 
 		if err == io.EOF {
 			tempFile.Close()
 			log.Printf("gRPC stream: leader stream finished target=%s session=%q chunks_received=%d output=%s", target, sessionID, chunksReceived, outputPath)
-			go schedulePlayback(localPlaybackAt, outputPath)
+			if liveSink != nil {
+				if !liveStarted {
+					delay := time.Until(localPlaybackAt)
+					if delay > 0 {
+						time.Sleep(delay)
+					}
+					if liveBuffer.Len() > 0 {
+						if _, writeErr := liveSink.Write(liveBuffer.Bytes()); writeErr != nil {
+							log.Printf("gRPC stream: failed flushing live buffer for session=%q: %v", sessionID, writeErr)
+						}
+					}
+				}
+				go func() {
+					if err := closeLiveSink(); err != nil {
+						log.Printf("gRPC stream: live playback process ended with error for session=%q: %v", sessionID, err)
+					}
+				}()
+			} else {
+				go schedulePlayback(localPlaybackAt, outputPath)
+			}
 			return nil
 		}
 		if err != nil {
 			tempFile.Close()
+			if liveSink != nil {
+				_ = liveSink.Close()
+			}
 			log.Printf("gRPC stream: receive error target=%s session=%q chunks_received=%d: %v", target, sessionID, chunksReceived, err)
 			return err
 		}
 		if chunk.EndOfStream {
 			tempFile.Close()
 			log.Printf("gRPC stream: received final chunk target=%s session=%q chunks_received=%d output=%s", target, sessionID, chunksReceived, outputPath)
-			go schedulePlayback(localPlaybackAt, outputPath)
+			if liveSink != nil {
+				if !liveStarted {
+					delay := time.Until(localPlaybackAt)
+					if delay > 0 {
+						time.Sleep(delay)
+					}
+					if liveBuffer.Len() > 0 {
+						if _, writeErr := liveSink.Write(liveBuffer.Bytes()); writeErr != nil {
+							log.Printf("gRPC stream: failed flushing live buffer for session=%q: %v", sessionID, writeErr)
+						}
+					}
+				}
+				go func() {
+					if err := closeLiveSink(); err != nil {
+						log.Printf("gRPC stream: live playback process ended with error for session=%q: %v", sessionID, err)
+					}
+				}()
+			} else {
+				go schedulePlayback(localPlaybackAt, outputPath)
+			}
 			return nil
 		}
 
 		chunksReceived++
+		if !firstChunkLogged {
+			firstChunkLogged = true
+			now := time.Now()
+			log.Printf("gRPC stream: follower first chunk session=%q target=%s at=%s until_local_playback=%s", sessionID, target, now.Format(time.RFC3339Nano), time.Until(localPlaybackAt))
+		}
 		if _, err := tempFile.Write(chunk.Data); err != nil {
 			tempFile.Close()
+			if liveSink != nil {
+				_ = liveSink.Close()
+			}
 			log.Printf("gRPC stream: failed to write chunk to %s: %v", outputPath, err)
 			return err
+		}
+
+		if liveSink != nil {
+			now := time.Now()
+			if !liveStarted && now.Before(localPlaybackAt) {
+				if _, err := liveBuffer.Write(chunk.Data); err != nil {
+					log.Printf("gRPC stream: failed to buffer live chunk session=%q: %v", sessionID, err)
+				}
+			} else {
+				if !liveStarted {
+					if liveBuffer.Len() > 0 {
+						if _, err := liveSink.Write(liveBuffer.Bytes()); err != nil {
+							log.Printf("gRPC stream: failed writing buffered data to live sink session=%q: %v", sessionID, err)
+						}
+					}
+					liveStarted = true
+				}
+				if _, err := liveSink.Write(chunk.Data); err != nil {
+					log.Printf("gRPC stream: failed to write live chunk session=%q seq=%d: %v", sessionID, chunk.Sequence, err)
+				}
+			}
 		}
 
 		log.Printf("gRPC stream: received chunk seq=%d size=%d target=%s session=%q", chunk.Sequence, len(chunk.Data), target, sessionID)
