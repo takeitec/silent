@@ -16,15 +16,16 @@ import (
 )
 
 type config struct {
-	id          string
-	broadcastIP string
-	port        int
-	controlPort int
-	grpcPort    int
-	leader      bool
-	wavPath     string
-	room        bool
-	roomURL     string
+	id            string
+	broadcastIP   string
+	port          int
+	controlPort   int
+	grpcPort      int
+	leader        bool
+	wavPath       string
+	room          bool
+	roomURL       string
+	advertiseHost string
 }
 
 func main() {
@@ -50,18 +51,20 @@ func parseFlags() config {
 	wavPath := flag.String("wav", "", "optional wav file to play")
 	room := flag.Bool("room", true, "use room-based discovery instead of UDP broadcast")
 	roomURL := flag.String("room-url", "http://127.0.0.1:9100", "room service base URL")
+	advertiseHost := flag.String("advertise-host", "", "override the host advertised to other peers")
 	flag.Parse()
 
 	return config{
-		id:          *id,
-		broadcastIP: *broadcastIP,
-		port:        *port,
-		controlPort: *controlPortFlag,
-		grpcPort:    *grpcPort,
-		leader:      *leader,
-		wavPath:     *wavPath,
-		room:        *room,
-		roomURL:     *roomURL,
+		id:            *id,
+		broadcastIP:   *broadcastIP,
+		port:          *port,
+		controlPort:   *controlPortFlag,
+		grpcPort:      *grpcPort,
+		leader:        *leader,
+		wavPath:       *wavPath,
+		room:          *room,
+		roomURL:       *roomURL,
+		advertiseHost: *advertiseHost,
 	}
 }
 

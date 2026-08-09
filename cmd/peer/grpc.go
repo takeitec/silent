@@ -7,27 +7,33 @@ import (
 	"log"
 	"net"
 	"os"
+	"strconv"
 	"strings"
+	stdsync "sync"
 	"time"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/peer"
 
 	"silent/internal/control"
 	"silent/internal/models"
 	"silent/internal/peerlist"
-	"silent/internal/sync"
+	syncutil "silent/internal/sync"
 )
 
 type peerControlServer struct {
 	control.UnimplementedPeerControlServer
 
-	id       string
-	isLeader bool
-	pl       *peerlist.PeerList
-	grpcPort int
-	wavPath  string
-	offsetCh chan time.Duration
+	id             string
+	isLeader       bool
+	pl             *peerlist.PeerList
+	grpcPort       int
+	wavPath        string
+	offsetCh       chan time.Duration
+	sessionMu      stdsync.Mutex
+	activeSessions map[string]time.Time
 }
 
 func (s *peerControlServer) StartPlayback(ctx context.Context, req *control.PlaybackRequest) (*control.PlaybackResponse, error) {
@@ -48,7 +54,14 @@ func (s *peerControlServer) StartPlayback(ctx context.Context, req *control.Play
 			continue
 		}
 
-		target := fmt.Sprintf("%s:%d", hostFromAddress(p.Address), s.grpcPort)
+		target := peerTarget(p.Address, s.grpcPort)
+		if target == "" {
+			continue
+		}
+		if target == fmt.Sprintf("127.0.0.1:%d", s.grpcPort) || target == fmt.Sprintf("localhost:%d", s.grpcPort) {
+			log.Printf("gRPC: skipping self-targeted peer %s at %s", p.ID, target)
+			continue
+		}
 		log.Printf("gRPC: notifying peer %s at %s", p.ID, target)
 
 		conn, err := grpc.NewClient(target, grpc.WithTransportCredentials(insecure.NewCredentials()))
@@ -86,7 +99,7 @@ func (s *peerControlServer) NotifyPlayback(ctx context.Context, req *control.Pla
 	default:
 	}
 
-	localAt := sync.ConvertSharedTimeToLocal(sharedAt, offset)
+	localAt := syncutil.ConvertSharedTimeToLocal(sharedAt, offset)
 
 	log.Printf("received playback command for %s at local %s", req.AudioId, localAt.Format(time.RFC3339Nano))
 
@@ -110,6 +123,33 @@ func hostFromAddress(addr string) string {
 	}
 
 	return host
+}
+
+func peerTarget(addr string, grpcPort int) string {
+	trimmed := strings.TrimSpace(addr)
+	if trimmed == "" {
+		return ""
+	}
+
+	if strings.Contains(trimmed, "@") {
+		parts := strings.SplitN(trimmed, "@", 2)
+		if len(parts) == 2 && strings.TrimSpace(parts[1]) != "" {
+			trimmed = strings.TrimSpace(parts[1])
+		}
+	}
+
+	if host, port, err := net.SplitHostPort(trimmed); err == nil {
+		if port != "" && port != "0" {
+			return net.JoinHostPort(host, port)
+		}
+		return net.JoinHostPort(host, strconv.Itoa(grpcPort))
+	}
+
+	host := hostFromAddress(trimmed)
+	if host == "" {
+		return ""
+	}
+	return net.JoinHostPort(host, strconv.Itoa(grpcPort))
 }
 
 func startGRPCServer(addr string, srv *peerControlServer) error {
@@ -144,8 +184,24 @@ func triggerPlaybackOnLeader(addr string) error {
 func (s *peerControlServer) StartStreamPlayback(ctx context.Context, req *control.StreamPlaybackRequest) (*control.StreamPlaybackResponse, error) {
 	log.Printf("gRPC stream: StartStreamPlayback session=%q audio_id=%q audio_path=%q shared_at=%s", req.SessionId, req.AudioId, req.AudioPath, time.Unix(0, req.SharedAtNanos).Format(time.RFC3339Nano))
 
+	if !s.beginSession(req.SessionId) {
+		log.Printf("gRPC stream: ignoring duplicate session=%q", req.SessionId)
+		return &control.StreamPlaybackResponse{
+			Accepted:  true,
+			SessionId: req.SessionId,
+			Message:   "stream already in progress",
+		}, nil
+	}
+
 	if !s.isLeader {
 		target := s.leaderTarget()
+		if target == "" {
+			log.Printf("gRPC stream: follower has no reachable leader target for session=%q", req.SessionId)
+			return &control.StreamPlaybackResponse{
+				Accepted: false,
+				Message:  "leader not discovered",
+			}, nil
+		}
 		sharedAt := time.Unix(0, req.SharedAtNanos)
 
 		if err := s.receiveAudioFromLeader(ctx, target, req.SessionId, req.AudioId, req.AudioPath, sharedAt); err != nil {
@@ -172,8 +228,15 @@ func (s *peerControlServer) StartStreamPlayback(ctx context.Context, req *contro
 			continue
 		}
 
-		target := fmt.Sprintf("%s:%d", hostFromAddress(p.Address), s.grpcPort)
-		log.Printf("gRPC stream: telling follower=%s to receive from leader session=%q", p.ID, req.SessionId)
+		target := peerTarget(p.Address, s.grpcPort)
+		if target == "" {
+			continue
+		}
+		if target == fmt.Sprintf("127.0.0.1:%d", s.grpcPort) || target == fmt.Sprintf("localhost:%d", s.grpcPort) {
+			log.Printf("gRPC stream: skipping self-targeted follower=%s at %s", p.ID, target)
+			continue
+		}
+		log.Printf("gRPC stream: leader telling follower=%s to receive from leader session=%q target=%s", p.ID, req.SessionId, target)
 
 		conn, err := grpc.NewClient(target, grpc.WithTransportCredentials(insecure.NewCredentials()))
 		if err != nil {
@@ -190,7 +253,7 @@ func (s *peerControlServer) StartStreamPlayback(ctx context.Context, req *contro
 			continue
 		}
 
-		log.Printf("gRPC stream: follower=%s accepted stream start", p.ID)
+		log.Printf("gRPC stream: follower=%s accepted stream start session=%q target=%s", p.ID, req.SessionId, target)
 	}
 
 	return &control.StreamPlaybackResponse{
@@ -200,8 +263,72 @@ func (s *peerControlServer) StartStreamPlayback(ctx context.Context, req *contro
 	}, nil
 }
 
+var sessionLease = 30 * time.Second
+
+func (s *peerControlServer) beginSession(sessionID string) bool {
+	s.sessionMu.Lock()
+	defer s.sessionMu.Unlock()
+
+	if s.activeSessions == nil {
+		s.activeSessions = make(map[string]time.Time)
+	}
+	if sessionID == "" {
+		sessionID = "default"
+	}
+
+	now := time.Now()
+	if expiry, ok := s.activeSessions[sessionID]; ok {
+		if now.Before(expiry) {
+			return false
+		}
+	}
+
+	s.activeSessions[sessionID] = now.Add(sessionLease)
+	return true
+}
+
+func (s *peerControlServer) finishSession(sessionID string) {
+	s.sessionMu.Lock()
+	defer s.sessionMu.Unlock()
+
+	if sessionID == "" {
+		sessionID = "default"
+	}
+	delete(s.activeSessions, sessionID)
+}
+
+func streamTarget(ctx context.Context) string {
+	if ctx == nil {
+		return "<unknown>"
+	}
+
+	if p, ok := peer.FromContext(ctx); ok {
+		if p.Addr != nil {
+			return p.Addr.String()
+		}
+	}
+
+	if md, ok := metadata.FromIncomingContext(ctx); ok {
+		if vals := md.Get("x-peer-address"); len(vals) > 0 {
+			return vals[0]
+		}
+		if vals := md.Get("peer"); len(vals) > 0 {
+			return vals[0]
+		}
+	}
+
+	if v := ctx.Value("peer"); v != nil {
+		if s, ok := v.(string); ok {
+			return s
+		}
+	}
+
+	return "<unknown>"
+}
+
 func (s *peerControlServer) StreamAudio(req *control.StreamPlaybackRequest, stream control.PeerControl_StreamAudioServer) error {
-	log.Printf("gRPC stream: server handler started session=%q audio_id=%q path=%q", req.SessionId, req.AudioId, req.AudioPath)
+	target := streamTarget(stream.Context())
+	log.Printf("gRPC stream: server handler started session=%q audio_id=%q path=%q target=%s", req.SessionId, req.AudioId, req.AudioPath, target)
 
 	f, err := os.Open(req.AudioPath)
 	if err != nil {
@@ -224,11 +351,11 @@ func (s *peerControlServer) StreamAudio(req *control.StreamPlaybackRequest, stre
 				EndOfStream: false,
 			}
 			if err := stream.Send(chunk); err != nil {
-				log.Printf("gRPC stream: failed to send chunk seq=%d session=%q: %v", seq, req.SessionId, err)
+				log.Printf("gRPC stream: failed to send chunk seq=%d session=%q target=%s: %v", seq, req.SessionId, target, err)
 				return err
 			}
 			chunksSent++
-			log.Printf("gRPC stream: sent chunk seq=%d size=%d session=%q", seq, len(chunk.Data), req.SessionId)
+			log.Printf("gRPC stream: sent chunk seq=%d size=%d session=%q target=%s", seq, len(chunk.Data), req.SessionId, target)
 			seq++
 		}
 
@@ -248,11 +375,11 @@ func (s *peerControlServer) StreamAudio(req *control.StreamPlaybackRequest, stre
 		EndOfStream: true,
 	}
 	if err := stream.Send(finalChunk); err != nil {
-		log.Printf("gRPC stream: failed to send final chunk session=%q: %v", req.SessionId, err)
+		log.Printf("gRPC stream: failed to send final chunk session=%q target=%s: %v", req.SessionId, target, err)
 		return err
 	}
 
-	log.Printf("gRPC stream: finished session=%q chunks_sent=%d", req.SessionId, chunksSent)
+	log.Printf("gRPC stream: finished session=%q chunks_sent=%d target=%s", req.SessionId, chunksSent, target)
 	return nil
 }
 
@@ -285,7 +412,7 @@ func (s *peerControlServer) receiveAudioFromLeader(ctx context.Context, target, 
 	default:
 	}
 
-	localPlaybackAt := sync.ConvertSharedTimeToLocal(sharedAt, offset)
+	localPlaybackAt := syncutil.ConvertSharedTimeToLocal(sharedAt, offset)
 
 	chunksReceived := 0
 	tempFile, err := os.CreateTemp("", fmt.Sprintf("silent-%s-%s-*.wav", sanitizeForFilename(sessionID), sanitizeForFilename(audioID)))
@@ -413,8 +540,16 @@ func sanitizeForFilename(value string) string {
 func (s *peerControlServer) leaderTarget() string {
 	if s.pl != nil {
 		if leader := s.pl.Leader(); leader != nil {
-			return fmt.Sprintf("%s:%d", hostFromAddress(leader.Address), s.grpcPort)
+			if leader.ID == s.id {
+				return ""
+			}
+			if target := peerTarget(leader.Address, s.grpcPort); target != "" {
+				if target == fmt.Sprintf("127.0.0.1:%d", s.grpcPort) || target == fmt.Sprintf("localhost:%d", s.grpcPort) {
+					return ""
+				}
+				return target
+			}
 		}
 	}
-	return fmt.Sprintf("127.0.0.1:%d", s.grpcPort)
+	return ""
 }

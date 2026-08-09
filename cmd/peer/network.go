@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"log"
 	"net"
-	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -149,9 +148,9 @@ func validateBroadcastIP(raw string) (string, error) {
 	return ip.String(), nil
 }
 
-func advertiseAddress(grpcPort int) string {
-	if host := os.Getenv("SILENT_ADVERTISE_HOST"); host != "" {
-		return net.JoinHostPort(host, strconv.Itoa(grpcPort))
+func advertiseAddress(grpcPort int, override string) string {
+	if override != "" {
+		return net.JoinHostPort(override, strconv.Itoa(grpcPort))
 	}
 
 	addrs, err := net.InterfaceAddrs()
@@ -175,7 +174,7 @@ func registerWithRoom(cfg config, roomURL string) *discovery.Client {
 	peer := discovery.PeerInfo{
 		ID:      cfg.id,
 		RoomID:  "demo-room",
-		Address: advertiseAddress(cfg.grpcPort),
+		Address: advertiseAddress(cfg.grpcPort, cfg.advertiseHost),
 		Role:    role,
 	}
 
