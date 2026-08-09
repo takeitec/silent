@@ -59,7 +59,7 @@ func TestPeerTargetUsesAdvertisedPort(t *testing.T) {
 
 func TestLeaderTargetSkipsSelf(t *testing.T) {
 	srv := &peerControlServer{id: "follower-A", pl: peerlist.New(), grpcPort: 50052}
-	srv.pl.Add("follower-A", "127.0.0.1:50052", models.RoleFollower)
+	srv.pl.Add("follower-A", "127.0.0.1:50052", models.RoleFollower, 0)
 
 	if got := srv.leaderTarget(); got != "" {
 		t.Fatalf("expected self leader target to be rejected, got %q", got)

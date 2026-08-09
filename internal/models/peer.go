@@ -12,8 +12,9 @@ const (
 
 // Peer describes an individual peer in the network.
 type Peer struct {
-	ID      string
-	Address string
-	Role    Role
-	SeenAt  time.Time
+	ID          string
+	Address     string
+	Role        Role
+	ControlPort int
+	SeenAt      time.Time
 }

@@ -15,10 +15,10 @@ func New() *PeerList {
 	return &PeerList{peers: make(map[string]models.Peer)}
 }
 
-func (p *PeerList) Add(id, addr string, role models.Role) {
+func (p *PeerList) Add(id, addr string, role models.Role, controlPort int) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	p.peers[id] = models.Peer{ID: id, Address: addr, Role: role}
+	p.peers[id] = models.Peer{ID: id, Address: addr, Role: role, ControlPort: controlPort}
 }
 
 func (p *PeerList) Reset() {

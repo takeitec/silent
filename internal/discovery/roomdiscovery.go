@@ -9,10 +9,11 @@ import (
 )
 
 type PeerInfo struct {
-	ID      string `json:"id"`
-	RoomID  string `json:"room_id"`
-	Address string `json:"address"`
-	Role    string `json:"role"`
+	ID          string `json:"id"`
+	RoomID      string `json:"room_id"`
+	Address     string `json:"address"`
+	Role        string `json:"role"`
+	ControlPort int    `json:"control_port"`
 }
 
 type RegisterRequest struct {

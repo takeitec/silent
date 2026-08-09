@@ -172,10 +172,11 @@ func registerWithRoom(cfg config, roomURL string) *discovery.Client {
 	}
 
 	peer := discovery.PeerInfo{
-		ID:      cfg.id,
-		RoomID:  "demo-room",
-		Address: advertiseAddress(cfg.grpcPort, cfg.advertiseHost),
-		Role:    role,
+		ID:          cfg.id,
+		RoomID:      "demo-room",
+		Address:     advertiseAddress(cfg.grpcPort, cfg.advertiseHost),
+		Role:        role,
+		ControlPort: effectiveControlPort(cfg),
 	}
 
 	client := discovery.NewClient(roomURL, peer)

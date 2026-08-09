@@ -97,14 +97,11 @@ func newPeerApp(cfg config) (*peerApp, error) {
 		if h, _, err := net.SplitHostPort(p.Address); err == nil {
 			host = h
 		}
-		pl.Add(p.ID, host, p.Role)
+		pl.Add(p.ID, host, p.Role, 0)
 		log.Printf("discovered peer %s (%s) role=%s", p.ID, host, p.Role)
 	})
 
-	controlPort := cfg.controlPort
-	if controlPort == 0 {
-		controlPort = cfg.port + 1
-	}
+	controlPort := effectiveControlPort(cfg)
 
 	listener, err := net.ListenUDP("udp4", &net.UDPAddr{
 		IP:   net.ParseIP("0.0.0.0"),
@@ -131,6 +128,36 @@ func newPeerApp(cfg config) (*peerApp, error) {
 			offsetCh: offsetCh,
 		},
 	}, nil
+}
+
+func shouldProbeLeader(cfg config, leader *models.Peer) bool {
+	if cfg.leader || leader == nil {
+		return false
+	}
+	return true
+}
+
+func effectiveControlPort(cfg config) int {
+	if cfg.controlPort > 0 {
+		return cfg.controlPort
+	}
+	if cfg.room && cfg.port > 0 {
+		return cfg.port
+	}
+	if cfg.port > 0 {
+		return cfg.port + 1
+	}
+	return 0
+}
+
+func peerControlPort(peer models.Peer, fallback int) int {
+	if peer.ControlPort > 0 {
+		return peer.ControlPort
+	}
+	if fallback > 0 {
+		return fallback
+	}
+	return 0
 }
 
 func (a *peerApp) Run() error {
@@ -165,6 +192,9 @@ func (a *peerApp) Run() error {
 		}
 	}()
 
+	if a.cfg.leader {
+		fmt.Println("leader mode enabled")
+	}
 	if a.cfg.room {
 		roomURL := a.cfg.roomURL
 		if roomURL == "" {
@@ -172,9 +202,6 @@ func (a *peerApp) Run() error {
 		}
 
 		a.roomClient = registerWithRoom(a.cfg, roomURL)
-		if a.cfg.leader {
-			fmt.Println("leader mode enabled")
-		}
 
 		go func() {
 			if a.roomClient == nil {
@@ -198,7 +225,7 @@ func (a *peerApp) Run() error {
 					if p.ID == a.cfg.id {
 						continue
 					}
-					a.pl.Add(p.ID, p.Address, role)
+					a.pl.Add(p.ID, p.Address, role, p.ControlPort)
 					if role == models.RoleLeader {
 						log.Printf("leader is %s at %s", p.ID, p.Address)
 					}
@@ -208,27 +235,31 @@ func (a *peerApp) Run() error {
 	}
 	if !a.cfg.room {
 		fmt.Printf("peer %s listening on udp:%d (control:%d)\n", a.cfg.id, a.cfg.port, a.cfg.controlPort)
-
-		if a.cfg.leader {
-			fmt.Println("leader mode enabled")
-		} else {
-			go func() {
-				log.Printf("follower %s waiting for leader discovery", a.cfg.id)
-				for {
-					leader := a.pl.Leader()
-					if leader != nil {
-						log.Printf("follower %s discovered leader %s at %s", a.cfg.id, leader.ID, leader.Address)
-						if err := probeLeader(*leader, a.cfg.id, a.listener.LocalAddr().(*net.UDPAddr).Port, a.offsetCh); err != nil {
-							log.Printf("clock sync failed: %v", err)
-						}
-					} else {
-						log.Printf("follower %s has not discovered a leader yet", a.cfg.id)
-					}
-					time.Sleep(2 * time.Second)
-				}
-			}()
-		}
 	}
+
+	go func() {
+		if a.cfg.leader {
+			return
+		}
+
+		ticker := time.NewTicker(2 * time.Second)
+		defer ticker.Stop()
+
+		for range ticker.C {
+			leader := a.pl.Leader()
+			if !shouldProbeLeader(a.cfg, leader) {
+				if leader == nil {
+					log.Printf("follower %s has not discovered a leader yet", a.cfg.id)
+				}
+				continue
+			}
+
+			log.Printf("follower %s discovered leader %s at %s", a.cfg.id, leader.ID, leader.Address)
+			if err := probeLeader(*leader, a.cfg.id, peerControlPort(*leader, effectiveControlPort(a.cfg)), a.offsetCh); err != nil {
+				log.Printf("clock sync failed: %v", err)
+			}
+		}
+	}()
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
