@@ -23,6 +23,8 @@ type config struct {
 	grpcPort    int
 	leader      bool
 	wavPath     string
+	room        bool
+	roomURL     string
 }
 
 func main() {
@@ -46,6 +48,8 @@ func parseFlags() config {
 	grpcPort := flag.Int("grpc-port", 50051, "gRPC control port")
 	leader := flag.Bool("leader", false, "act as the leader for scheduling")
 	wavPath := flag.String("wav", "", "optional wav file to play")
+	room := flag.Bool("room", true, "use room-based discovery instead of UDP broadcast")
+	roomURL := flag.String("room-url", "http://127.0.0.1:9100", "room service base URL")
 	flag.Parse()
 
 	return config{
@@ -56,6 +60,8 @@ func parseFlags() config {
 		grpcPort:    *grpcPort,
 		leader:      *leader,
 		wavPath:     *wavPath,
+		room:        *room,
+		roomURL:     *roomURL,
 	}
 }
 
@@ -66,6 +72,7 @@ type peerApp struct {
 	listener   *net.UDPConn
 	offsetCh   chan time.Duration
 	grpcServer *peerControlServer
+	roomClient *discovery.Client
 }
 
 func newPeerApp(cfg config) (*peerApp, error) {
@@ -126,20 +133,22 @@ func newPeerApp(cfg config) (*peerApp, error) {
 func (a *peerApp) Run() error {
 	defer a.listener.Close()
 
-	go func() {
-		for {
-			if err := a.ann.Announce(); err != nil {
-				log.Printf("announce failed: %v", err)
+	if !a.cfg.room {
+		go func() {
+			for {
+				if err := a.ann.Announce(); err != nil {
+					log.Printf("announce failed: %v", err)
+				}
+				time.Sleep(1 * time.Second)
 			}
-			time.Sleep(1 * time.Second)
-		}
-	}()
+		}()
 
-	go func() {
-		if err := a.ann.Start(); err != nil {
-			log.Printf("discovery stopped: %v", err)
-		}
-	}()
+		go func() {
+			if err := a.ann.Start(); err != nil {
+				log.Printf("discovery stopped: %v", err)
+			}
+		}()
+	}
 
 	go func() {
 		if err := handleControl(a.listener, a.cfg.leader); err != nil {
@@ -153,25 +162,69 @@ func (a *peerApp) Run() error {
 		}
 	}()
 
-	fmt.Printf("peer %s listening on udp:%d (control:%d)\n", a.cfg.id, a.cfg.port, a.cfg.controlPort)
-	if a.cfg.leader {
-		fmt.Println("leader mode enabled")
-	} else {
+	if a.cfg.room {
+		roomURL := a.cfg.roomURL
+		if roomURL == "" {
+			roomURL = "http://127.0.0.1:9100"
+		}
+
+		a.roomClient = registerWithRoom(a.cfg, roomURL)
+		if a.cfg.leader {
+			fmt.Println("leader mode enabled")
+		}
+
 		go func() {
-			log.Printf("follower %s waiting for leader discovery", a.cfg.id)
-			for {
-				leader := a.pl.Leader()
-				if leader != nil {
-					log.Printf("follower %s discovered leader %s at %s", a.cfg.id, leader.ID, leader.Address)
-					if err := probeLeader(*leader, a.cfg.id, a.listener.LocalAddr().(*net.UDPAddr).Port, a.offsetCh); err != nil {
-						log.Printf("clock sync failed: %v", err)
-					}
-				} else {
-					log.Printf("follower %s has not discovered a leader yet", a.cfg.id)
+			if a.roomClient == nil {
+				return
+			}
+
+			ticker := time.NewTicker(2 * time.Second)
+			defer ticker.Stop()
+
+			for range ticker.C {
+				state, err := a.roomClient.RoomState()
+				if err != nil {
+					log.Printf("room state lookup failed: %v", err)
+					continue
 				}
-				time.Sleep(2 * time.Second)
+
+				log.Printf("room state: leader=%s peers=%d", state.Leader, len(state.Peers))
+				a.pl.Reset()
+				for _, p := range state.Peers {
+					role := models.Role(p.Role)
+					if p.ID == a.cfg.id {
+						continue
+					}
+					a.pl.Add(p.ID, p.Address, role)
+					if role == models.RoleLeader {
+						log.Printf("leader is %s at %s", p.ID, p.Address)
+					}
+				}
 			}
 		}()
+	}
+	if !a.cfg.room {
+		fmt.Printf("peer %s listening on udp:%d (control:%d)\n", a.cfg.id, a.cfg.port, a.cfg.controlPort)
+
+		if a.cfg.leader {
+			fmt.Println("leader mode enabled")
+		} else {
+			go func() {
+				log.Printf("follower %s waiting for leader discovery", a.cfg.id)
+				for {
+					leader := a.pl.Leader()
+					if leader != nil {
+						log.Printf("follower %s discovered leader %s at %s", a.cfg.id, leader.ID, leader.Address)
+						if err := probeLeader(*leader, a.cfg.id, a.listener.LocalAddr().(*net.UDPAddr).Port, a.offsetCh); err != nil {
+							log.Printf("clock sync failed: %v", err)
+						}
+					} else {
+						log.Printf("follower %s has not discovered a leader yet", a.cfg.id)
+					}
+					time.Sleep(2 * time.Second)
+				}
+			}()
+		}
 	}
 
 	sigCh := make(chan os.Signal, 1)

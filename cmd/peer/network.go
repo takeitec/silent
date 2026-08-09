@@ -2,11 +2,14 @@ package main
 
 import (
 	"fmt"
+	"log"
 	"net"
+	"os"
 	"strconv"
 	"strings"
 	"time"
 
+	"silent/internal/discovery"
 	"silent/internal/models"
 	"silent/internal/sync"
 )
@@ -144,4 +147,50 @@ func validateBroadcastIP(raw string) (string, error) {
 	}
 
 	return ip.String(), nil
+}
+
+func advertiseAddress(grpcPort int) string {
+	if host := os.Getenv("SILENT_ADVERTISE_HOST"); host != "" {
+		return net.JoinHostPort(host, strconv.Itoa(grpcPort))
+	}
+
+	addrs, err := net.InterfaceAddrs()
+	if err == nil {
+		for _, addr := range addrs {
+			if ipnet, ok := addr.(*net.IPNet); ok && !ipnet.IP.IsLoopback() && ipnet.IP.To4() != nil {
+				return net.JoinHostPort(ipnet.IP.String(), strconv.Itoa(grpcPort))
+			}
+		}
+	}
+
+	return net.JoinHostPort("127.0.0.1", strconv.Itoa(grpcPort))
+}
+
+func registerWithRoom(cfg config, roomURL string) *discovery.Client {
+	role := "FOLLOWER"
+	if cfg.leader {
+		role = "LEADER"
+	}
+
+	peer := discovery.PeerInfo{
+		ID:      cfg.id,
+		RoomID:  "demo-room",
+		Address: advertiseAddress(cfg.grpcPort),
+		Role:    role,
+	}
+
+	client := discovery.NewClient(roomURL, peer)
+
+	go func() {
+		for {
+			if err := client.Register(10 * time.Second); err != nil {
+				log.Printf("room register failed: %v", err)
+				time.Sleep(2 * time.Second)
+				continue
+			}
+			time.Sleep(5 * time.Second)
+		}
+	}()
+
+	return client
 }

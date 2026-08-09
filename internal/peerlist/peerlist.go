@@ -21,6 +21,12 @@ func (p *PeerList) Add(id, addr string, role models.Role) {
 	p.peers[id] = models.Peer{ID: id, Address: addr, Role: role}
 }
 
+func (p *PeerList) Reset() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.peers = make(map[string]models.Peer)
+}
+
 func (p *PeerList) Peers() []models.Peer {
 	p.mu.Lock()
 	defer p.mu.Unlock()
