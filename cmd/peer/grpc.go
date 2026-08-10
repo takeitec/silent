@@ -32,6 +32,8 @@ type peerControlServer struct {
 	pl             *peerlist.PeerList
 	grpcPort       int
 	wavPath        string
+	liveCapture    bool
+	captureDevice  string
 	offsetCh       chan time.Duration
 	sessionMu      stdsync.Mutex
 	activeSessions map[string]time.Time
@@ -358,18 +360,24 @@ func (s *peerControlServer) StreamAudio(req *control.StreamPlaybackRequest, stre
 	target := streamTarget(stream.Context())
 	log.Printf("gRPC stream: server handler started session=%q audio_id=%q path=%q target=%s", req.SessionId, req.AudioId, req.AudioPath, target)
 
-	f, err := os.Open(req.AudioPath)
+	source, sourceName, closeSource, err := s.openStreamSource(req)
 	if err != nil {
-		return fmt.Errorf("open audio file: %w", err)
+		return err
 	}
-	defer f.Close()
+	defer func() {
+		if closeErr := closeSource(); closeErr != nil {
+			log.Printf("gRPC stream: source close error (%s): %v", sourceName, closeErr)
+		}
+	}()
+
+	log.Printf("gRPC stream: using source=%s for session=%q", sourceName, req.SessionId)
 
 	buf := make([]byte, 32*1024)
 	seq := int64(0)
 	chunksSent := 0
 
 	for {
-		n, err := f.Read(buf)
+		n, err := source.Read(buf)
 		if n > 0 {
 			chunk := &control.AudioChunk{
 				SessionId:   req.SessionId,
@@ -391,7 +399,7 @@ func (s *peerControlServer) StreamAudio(req *control.StreamPlaybackRequest, stre
 			break
 		}
 		if err != nil {
-			log.Printf("gRPC stream: read error for session=%q: %v", req.SessionId, err)
+			log.Printf("gRPC stream: read error from source=%s for session=%q: %v", sourceName, req.SessionId, err)
 			return err
 		}
 	}

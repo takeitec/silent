@@ -5,7 +5,6 @@ import (
 	"io"
 	"log"
 	"os/exec"
-	"runtime"
 	"time"
 )
 
@@ -16,22 +15,16 @@ func schedulePlayback(at time.Time, wavPath string) {
 	}
 
 	if wavPath != "" {
-		if runtime.GOOS == "windows" {
-			log.Printf("playback: Windows host detected; skipping external audio player")
-			fmt.Print("\a")
-			return
-		}
-
-		if _, err := exec.LookPath("aplay"); err == nil {
-			cmd := exec.Command("aplay", wavPath)
+		if _, err := exec.LookPath("ffplay"); err == nil {
+			cmd := exec.Command("ffplay", "-nodisp", "-autoexit", "-loglevel", "error", wavPath)
 			if err := cmd.Start(); err != nil {
 				log.Printf("playback failed: %v", err)
 			}
 			return
 		}
 
-		if _, err := exec.LookPath("ffplay"); err == nil {
-			cmd := exec.Command("ffplay", "-nodisp", "-autoexit", wavPath)
+		if _, err := exec.LookPath("aplay"); err == nil {
+			cmd := exec.Command("aplay", wavPath)
 			if err := cmd.Start(); err != nil {
 				log.Printf("playback failed: %v", err)
 			}
@@ -46,10 +39,6 @@ func schedulePlayback(at time.Time, wavPath string) {
 }
 
 func startStreamingPlayback() (io.WriteCloser, func() error, error) {
-	if runtime.GOOS == "windows" {
-		return nil, nil, fmt.Errorf("streaming playback via pipe is not supported on windows host")
-	}
-
 	if _, err := exec.LookPath("ffplay"); err != nil {
 		return nil, nil, fmt.Errorf("ffplay is not available")
 	}

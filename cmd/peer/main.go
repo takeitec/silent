@@ -23,6 +23,8 @@ type config struct {
 	grpcPort      int
 	leader        bool
 	wavPath       string
+	liveCapture   bool
+	captureDevice string
 	room          bool
 	roomURL       string
 	advertiseHost string
@@ -49,6 +51,8 @@ func parseFlags() config {
 	grpcPort := flag.Int("grpc-port", 50051, "gRPC control port")
 	leader := flag.Bool("leader", false, "act as the leader for scheduling")
 	wavPath := flag.String("wav", "", "optional wav file to play")
+	liveCapture := flag.Bool("live-capture", true, "capture live system audio on leader instead of reading audio-path file")
+	captureDevice := flag.String("capture-device", "default", "system audio capture device (Linux PulseAudio/PipeWire monitor or Windows WASAPI endpoint, default auto device)")
 	room := flag.Bool("room", true, "use room-based discovery instead of UDP broadcast")
 	roomURL := flag.String("room-url", "http://127.0.0.1:9100", "room service base URL")
 	advertiseHost := flag.String("advertise-host", "", "override the host advertised to other peers")
@@ -62,6 +66,8 @@ func parseFlags() config {
 		grpcPort:      *grpcPort,
 		leader:        *leader,
 		wavPath:       *wavPath,
+		liveCapture:   *liveCapture,
+		captureDevice: *captureDevice,
 		room:          *room,
 		roomURL:       *roomURL,
 		advertiseHost: *advertiseHost,
@@ -121,12 +127,14 @@ func newPeerApp(cfg config) (*peerApp, error) {
 		listener: listener,
 		offsetCh: offsetCh,
 		grpcServer: &peerControlServer{
-			id:       cfg.id,
-			isLeader: cfg.leader,
-			pl:       pl,
-			grpcPort: cfg.grpcPort,
-			wavPath:  cfg.wavPath,
-			offsetCh: offsetCh,
+			id:            cfg.id,
+			isLeader:      cfg.leader,
+			pl:            pl,
+			grpcPort:      cfg.grpcPort,
+			wavPath:       cfg.wavPath,
+			liveCapture:   cfg.liveCapture,
+			captureDevice: cfg.captureDevice,
+			offsetCh:      offsetCh,
 		},
 	}, nil
 }
@@ -160,6 +168,10 @@ func probePortForLeader(peer models.Peer, fallback int) int {
 
 func (a *peerApp) Run() error {
 	defer a.listener.Close()
+
+	if err := validateMediaRuntime(a.cfg); err != nil {
+		return fmt.Errorf("media preflight failed: %w", err)
+	}
 
 	if !a.cfg.room {
 		go func() {
