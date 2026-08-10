@@ -67,6 +67,16 @@ func main() {
 		}
 		log.Printf("stream accepted=%v session=%s message=%s", resp.Accepted, resp.SessionId, resp.Message)
 
+	case "stop-stream":
+		resp, err := client.StopStreamPlayback(context.Background(), &control.StopStreamRequest{
+			SessionId: *sessionID,
+			Reason:    "client stop request",
+		})
+		if err != nil {
+			log.Fatalf("stop stream playback failed: %v", err)
+		}
+		log.Printf("stop-stream accepted=%v session=%s message=%s", resp.Accepted, resp.SessionId, resp.Message)
+
 	default:
 		usage()
 		os.Exit(2)
@@ -77,6 +87,7 @@ func usage() {
 	fmt.Println("usage:")
 	fmt.Println("  client play [flags]")
 	fmt.Println("  client stream [flags]")
+	fmt.Println("  client stop-stream [flags]")
 	fmt.Println("")
 	fmt.Println("flags:")
 	fmt.Println("  -leader-addr string")

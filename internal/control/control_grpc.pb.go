@@ -22,6 +22,7 @@ const (
 	PeerControl_StartPlayback_FullMethodName       = "/control.PeerControl/StartPlayback"
 	PeerControl_NotifyPlayback_FullMethodName      = "/control.PeerControl/NotifyPlayback"
 	PeerControl_StartStreamPlayback_FullMethodName = "/control.PeerControl/StartStreamPlayback"
+	PeerControl_StopStreamPlayback_FullMethodName  = "/control.PeerControl/StopStreamPlayback"
 	PeerControl_StreamAudio_FullMethodName         = "/control.PeerControl/StreamAudio"
 )
 
@@ -32,6 +33,7 @@ type PeerControlClient interface {
 	StartPlayback(ctx context.Context, in *PlaybackRequest, opts ...grpc.CallOption) (*PlaybackResponse, error)
 	NotifyPlayback(ctx context.Context, in *PlaybackCommand, opts ...grpc.CallOption) (*PlaybackAck, error)
 	StartStreamPlayback(ctx context.Context, in *StreamPlaybackRequest, opts ...grpc.CallOption) (*StreamPlaybackResponse, error)
+	StopStreamPlayback(ctx context.Context, in *StopStreamRequest, opts ...grpc.CallOption) (*StopStreamResponse, error)
 	StreamAudio(ctx context.Context, in *StreamPlaybackRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[AudioChunk], error)
 }
 
@@ -73,6 +75,16 @@ func (c *peerControlClient) StartStreamPlayback(ctx context.Context, in *StreamP
 	return out, nil
 }
 
+func (c *peerControlClient) StopStreamPlayback(ctx context.Context, in *StopStreamRequest, opts ...grpc.CallOption) (*StopStreamResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(StopStreamResponse)
+	err := c.cc.Invoke(ctx, PeerControl_StopStreamPlayback_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *peerControlClient) StreamAudio(ctx context.Context, in *StreamPlaybackRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[AudioChunk], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	stream, err := c.cc.NewStream(ctx, &PeerControl_ServiceDesc.Streams[0], PeerControl_StreamAudio_FullMethodName, cOpts...)
@@ -99,6 +111,7 @@ type PeerControlServer interface {
 	StartPlayback(context.Context, *PlaybackRequest) (*PlaybackResponse, error)
 	NotifyPlayback(context.Context, *PlaybackCommand) (*PlaybackAck, error)
 	StartStreamPlayback(context.Context, *StreamPlaybackRequest) (*StreamPlaybackResponse, error)
+	StopStreamPlayback(context.Context, *StopStreamRequest) (*StopStreamResponse, error)
 	StreamAudio(*StreamPlaybackRequest, grpc.ServerStreamingServer[AudioChunk]) error
 	mustEmbedUnimplementedPeerControlServer()
 }
@@ -118,6 +131,9 @@ func (UnimplementedPeerControlServer) NotifyPlayback(context.Context, *PlaybackC
 }
 func (UnimplementedPeerControlServer) StartStreamPlayback(context.Context, *StreamPlaybackRequest) (*StreamPlaybackResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method StartStreamPlayback not implemented")
+}
+func (UnimplementedPeerControlServer) StopStreamPlayback(context.Context, *StopStreamRequest) (*StopStreamResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method StopStreamPlayback not implemented")
 }
 func (UnimplementedPeerControlServer) StreamAudio(*StreamPlaybackRequest, grpc.ServerStreamingServer[AudioChunk]) error {
 	return status.Error(codes.Unimplemented, "method StreamAudio not implemented")
@@ -197,6 +213,24 @@ func _PeerControl_StartStreamPlayback_Handler(srv interface{}, ctx context.Conte
 	return interceptor(ctx, in, info, handler)
 }
 
+func _PeerControl_StopStreamPlayback_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(StopStreamRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(PeerControlServer).StopStreamPlayback(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: PeerControl_StopStreamPlayback_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(PeerControlServer).StopStreamPlayback(ctx, req.(*StopStreamRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _PeerControl_StreamAudio_Handler(srv interface{}, stream grpc.ServerStream) error {
 	m := new(StreamPlaybackRequest)
 	if err := stream.RecvMsg(m); err != nil {
@@ -226,6 +260,10 @@ var PeerControl_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "StartStreamPlayback",
 			Handler:    _PeerControl_StartStreamPlayback_Handler,
+		},
+		{
+			MethodName: "StopStreamPlayback",
+			Handler:    _PeerControl_StopStreamPlayback_Handler,
 		},
 	},
 	Streams: []grpc.StreamDesc{

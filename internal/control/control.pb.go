@@ -405,6 +405,118 @@ func (x *StreamPlaybackResponse) GetMessage() string {
 	return ""
 }
 
+type StopStreamRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	SessionId     string                 `protobuf:"bytes,1,opt,name=session_id,json=sessionId,proto3" json:"session_id,omitempty"`
+	Reason        string                 `protobuf:"bytes,2,opt,name=reason,proto3" json:"reason,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *StopStreamRequest) Reset() {
+	*x = StopStreamRequest{}
+	mi := &file_internal_control_control_proto_msgTypes[6]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *StopStreamRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*StopStreamRequest) ProtoMessage() {}
+
+func (x *StopStreamRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_internal_control_control_proto_msgTypes[6]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use StopStreamRequest.ProtoReflect.Descriptor instead.
+func (*StopStreamRequest) Descriptor() ([]byte, []int) {
+	return file_internal_control_control_proto_rawDescGZIP(), []int{6}
+}
+
+func (x *StopStreamRequest) GetSessionId() string {
+	if x != nil {
+		return x.SessionId
+	}
+	return ""
+}
+
+func (x *StopStreamRequest) GetReason() string {
+	if x != nil {
+		return x.Reason
+	}
+	return ""
+}
+
+type StopStreamResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Accepted      bool                   `protobuf:"varint,1,opt,name=accepted,proto3" json:"accepted,omitempty"`
+	SessionId     string                 `protobuf:"bytes,2,opt,name=session_id,json=sessionId,proto3" json:"session_id,omitempty"`
+	Message       string                 `protobuf:"bytes,3,opt,name=message,proto3" json:"message,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *StopStreamResponse) Reset() {
+	*x = StopStreamResponse{}
+	mi := &file_internal_control_control_proto_msgTypes[7]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *StopStreamResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*StopStreamResponse) ProtoMessage() {}
+
+func (x *StopStreamResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_internal_control_control_proto_msgTypes[7]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use StopStreamResponse.ProtoReflect.Descriptor instead.
+func (*StopStreamResponse) Descriptor() ([]byte, []int) {
+	return file_internal_control_control_proto_rawDescGZIP(), []int{7}
+}
+
+func (x *StopStreamResponse) GetAccepted() bool {
+	if x != nil {
+		return x.Accepted
+	}
+	return false
+}
+
+func (x *StopStreamResponse) GetSessionId() string {
+	if x != nil {
+		return x.SessionId
+	}
+	return ""
+}
+
+func (x *StopStreamResponse) GetMessage() string {
+	if x != nil {
+		return x.Message
+	}
+	return ""
+}
+
 type AudioChunk struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	SessionId     string                 `protobuf:"bytes,1,opt,name=session_id,json=sessionId,proto3" json:"session_id,omitempty"`
@@ -418,7 +530,7 @@ type AudioChunk struct {
 
 func (x *AudioChunk) Reset() {
 	*x = AudioChunk{}
-	mi := &file_internal_control_control_proto_msgTypes[6]
+	mi := &file_internal_control_control_proto_msgTypes[8]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -430,7 +542,7 @@ func (x *AudioChunk) String() string {
 func (*AudioChunk) ProtoMessage() {}
 
 func (x *AudioChunk) ProtoReflect() protoreflect.Message {
-	mi := &file_internal_control_control_proto_msgTypes[6]
+	mi := &file_internal_control_control_proto_msgTypes[8]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -443,7 +555,7 @@ func (x *AudioChunk) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AudioChunk.ProtoReflect.Descriptor instead.
 func (*AudioChunk) Descriptor() ([]byte, []int) {
-	return file_internal_control_control_proto_rawDescGZIP(), []int{6}
+	return file_internal_control_control_proto_rawDescGZIP(), []int{8}
 }
 
 func (x *AudioChunk) GetSessionId() string {
@@ -518,6 +630,15 @@ const file_internal_control_control_proto_rawDesc = "" +
 	"\baccepted\x18\x01 \x01(\bR\baccepted\x12\x1d\n" +
 	"\n" +
 	"session_id\x18\x02 \x01(\tR\tsessionId\x12\x18\n" +
+	"\amessage\x18\x03 \x01(\tR\amessage\"J\n" +
+	"\x11StopStreamRequest\x12\x1d\n" +
+	"\n" +
+	"session_id\x18\x01 \x01(\tR\tsessionId\x12\x16\n" +
+	"\x06reason\x18\x02 \x01(\tR\x06reason\"i\n" +
+	"\x12StopStreamResponse\x12\x1a\n" +
+	"\baccepted\x18\x01 \x01(\bR\baccepted\x12\x1d\n" +
+	"\n" +
+	"session_id\x18\x02 \x01(\tR\tsessionId\x12\x18\n" +
 	"\amessage\x18\x03 \x01(\tR\amessage\"\x9a\x01\n" +
 	"\n" +
 	"AudioChunk\x12\x1d\n" +
@@ -526,11 +647,12 @@ const file_internal_control_control_proto_rawDesc = "" +
 	"\baudio_id\x18\x02 \x01(\tR\aaudioId\x12\x1a\n" +
 	"\bsequence\x18\x03 \x01(\x03R\bsequence\x12\x12\n" +
 	"\x04data\x18\x04 \x01(\fR\x04data\x12\"\n" +
-	"\rend_of_stream\x18\x05 \x01(\bR\vendOfStream2\xb3\x02\n" +
+	"\rend_of_stream\x18\x05 \x01(\bR\vendOfStream2\x82\x03\n" +
 	"\vPeerControl\x12D\n" +
 	"\rStartPlayback\x12\x18.control.PlaybackRequest\x1a\x19.control.PlaybackResponse\x12@\n" +
 	"\x0eNotifyPlayback\x12\x18.control.PlaybackCommand\x1a\x14.control.PlaybackAck\x12V\n" +
-	"\x13StartStreamPlayback\x12\x1e.control.StreamPlaybackRequest\x1a\x1f.control.StreamPlaybackResponse\x12D\n" +
+	"\x13StartStreamPlayback\x12\x1e.control.StreamPlaybackRequest\x1a\x1f.control.StreamPlaybackResponse\x12M\n" +
+	"\x12StopStreamPlayback\x12\x1a.control.StopStreamRequest\x1a\x1b.control.StopStreamResponse\x12D\n" +
 	"\vStreamAudio\x12\x1e.control.StreamPlaybackRequest\x1a\x13.control.AudioChunk0\x01B\x19Z\x17silent/internal/controlb\x06proto3"
 
 var (
@@ -545,7 +667,7 @@ func file_internal_control_control_proto_rawDescGZIP() []byte {
 	return file_internal_control_control_proto_rawDescData
 }
 
-var file_internal_control_control_proto_msgTypes = make([]protoimpl.MessageInfo, 7)
+var file_internal_control_control_proto_msgTypes = make([]protoimpl.MessageInfo, 9)
 var file_internal_control_control_proto_goTypes = []any{
 	(*PlaybackRequest)(nil),        // 0: control.PlaybackRequest
 	(*PlaybackResponse)(nil),       // 1: control.PlaybackResponse
@@ -553,19 +675,23 @@ var file_internal_control_control_proto_goTypes = []any{
 	(*PlaybackAck)(nil),            // 3: control.PlaybackAck
 	(*StreamPlaybackRequest)(nil),  // 4: control.StreamPlaybackRequest
 	(*StreamPlaybackResponse)(nil), // 5: control.StreamPlaybackResponse
-	(*AudioChunk)(nil),             // 6: control.AudioChunk
+	(*StopStreamRequest)(nil),      // 6: control.StopStreamRequest
+	(*StopStreamResponse)(nil),     // 7: control.StopStreamResponse
+	(*AudioChunk)(nil),             // 8: control.AudioChunk
 }
 var file_internal_control_control_proto_depIdxs = []int32{
 	0, // 0: control.PeerControl.StartPlayback:input_type -> control.PlaybackRequest
 	2, // 1: control.PeerControl.NotifyPlayback:input_type -> control.PlaybackCommand
 	4, // 2: control.PeerControl.StartStreamPlayback:input_type -> control.StreamPlaybackRequest
-	4, // 3: control.PeerControl.StreamAudio:input_type -> control.StreamPlaybackRequest
-	1, // 4: control.PeerControl.StartPlayback:output_type -> control.PlaybackResponse
-	3, // 5: control.PeerControl.NotifyPlayback:output_type -> control.PlaybackAck
-	5, // 6: control.PeerControl.StartStreamPlayback:output_type -> control.StreamPlaybackResponse
-	6, // 7: control.PeerControl.StreamAudio:output_type -> control.AudioChunk
-	4, // [4:8] is the sub-list for method output_type
-	0, // [0:4] is the sub-list for method input_type
+	6, // 3: control.PeerControl.StopStreamPlayback:input_type -> control.StopStreamRequest
+	4, // 4: control.PeerControl.StreamAudio:input_type -> control.StreamPlaybackRequest
+	1, // 5: control.PeerControl.StartPlayback:output_type -> control.PlaybackResponse
+	3, // 6: control.PeerControl.NotifyPlayback:output_type -> control.PlaybackAck
+	5, // 7: control.PeerControl.StartStreamPlayback:output_type -> control.StreamPlaybackResponse
+	7, // 8: control.PeerControl.StopStreamPlayback:output_type -> control.StopStreamResponse
+	8, // 9: control.PeerControl.StreamAudio:output_type -> control.AudioChunk
+	5, // [5:10] is the sub-list for method output_type
+	0, // [0:5] is the sub-list for method input_type
 	0, // [0:0] is the sub-list for extension type_name
 	0, // [0:0] is the sub-list for extension extendee
 	0, // [0:0] is the sub-list for field type_name
@@ -582,7 +708,7 @@ func file_internal_control_control_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_internal_control_control_proto_rawDesc), len(file_internal_control_control_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   7,
+			NumMessages:   9,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

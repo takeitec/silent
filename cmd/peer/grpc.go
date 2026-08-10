@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -14,9 +15,11 @@ import (
 	"time"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/peer"
+	"google.golang.org/grpc/status"
 
 	"silent/internal/control"
 	"silent/internal/models"
@@ -37,6 +40,7 @@ type peerControlServer struct {
 	offsetCh       chan time.Duration
 	sessionMu      stdsync.Mutex
 	activeSessions map[string]time.Time
+	sessionCancels map[string]context.CancelFunc
 }
 
 func (s *peerControlServer) StartPlayback(ctx context.Context, req *control.PlaybackRequest) (*control.PlaybackResponse, error) {
@@ -186,13 +190,14 @@ func triggerPlaybackOnLeader(addr string) error {
 
 func (s *peerControlServer) StartStreamPlayback(ctx context.Context, req *control.StreamPlaybackRequest) (*control.StreamPlaybackResponse, error) {
 	streamFormat := normalizeStreamPlaybackRequest(req)
-	log.Printf("gRPC stream: StartStreamPlayback session=%q audio_id=%q audio_path=%q shared_at=%s", req.SessionId, req.AudioId, req.AudioPath, time.Unix(0, req.SharedAtNanos).Format(time.RFC3339Nano))
+	sessionID := normalizeSessionID(req.SessionId)
+	log.Printf("gRPC stream: StartStreamPlayback session=%q audio_id=%q audio_path=%q shared_at=%s", sessionID, req.AudioId, req.AudioPath, time.Unix(0, req.SharedAtNanos).Format(time.RFC3339Nano))
 
-	if !s.beginSession(req.SessionId) {
-		log.Printf("gRPC stream: ignoring duplicate session=%q", req.SessionId)
+	if !s.beginSession(sessionID) {
+		log.Printf("gRPC stream: ignoring duplicate session=%q", sessionID)
 		return &control.StreamPlaybackResponse{
 			Accepted:  true,
-			SessionId: req.SessionId,
+			SessionId: sessionID,
 			Message:   "stream already in progress",
 		}, nil
 	}
@@ -200,8 +205,8 @@ func (s *peerControlServer) StartStreamPlayback(ctx context.Context, req *contro
 	if !s.isLeader {
 		target := s.leaderTarget()
 		if target == "" {
-			s.finishSession(req.SessionId)
-			log.Printf("gRPC stream: follower has no reachable leader target for session=%q", req.SessionId)
+			s.finishSession(sessionID)
+			log.Printf("gRPC stream: follower has no reachable leader target for session=%q", sessionID)
 			return &control.StreamPlaybackResponse{
 				Accepted: false,
 				Message:  "leader not discovered",
@@ -210,16 +215,23 @@ func (s *peerControlServer) StartStreamPlayback(ctx context.Context, req *contro
 		sharedAt := time.Unix(0, req.SharedAtNanos)
 
 		go func() {
-			defer s.finishSession(req.SessionId)
-			log.Printf("gRPC stream: follower starting async receive session=%q target=%s at=%s format=%s rate=%d channels=%d", req.SessionId, target, time.Now().Format(time.RFC3339Nano), streamFormat.SampleFormat, streamFormat.SampleRate, streamFormat.Channels)
-			if err := s.receiveAudioFromLeader(context.Background(), target, req, sharedAt); err != nil {
-				log.Printf("gRPC stream: follower failed to receive session=%q from leader: %v", req.SessionId, err)
+			runCtx, cancel := context.WithCancel(context.Background())
+			s.setSessionCancel(sessionID, cancel)
+			defer s.clearSessionCancel(sessionID)
+			defer s.finishSession(sessionID)
+			log.Printf("gRPC stream: follower starting async receive session=%q target=%s at=%s format=%s rate=%d channels=%d", sessionID, target, time.Now().Format(time.RFC3339Nano), streamFormat.SampleFormat, streamFormat.SampleRate, streamFormat.Channels)
+			if err := s.receiveAudioFromLeader(runCtx, target, req, sharedAt); err != nil {
+				if errors.Is(err, context.Canceled) || status.Code(err) == codes.Canceled {
+					log.Printf("gRPC stream: follower stream stopped session=%q", sessionID)
+					return
+				}
+				log.Printf("gRPC stream: follower failed to receive session=%q from leader: %v", sessionID, err)
 			}
 		}()
 
 		return &control.StreamPlaybackResponse{
 			Accepted:  true,
-			SessionId: req.SessionId,
+			SessionId: sessionID,
 			Message:   "stream playback started",
 		}, nil
 	}
@@ -288,9 +300,87 @@ func (s *peerControlServer) StartStreamPlayback(ctx context.Context, req *contro
 
 	return &control.StreamPlaybackResponse{
 		Accepted:  true,
-		SessionId: req.SessionId,
+		SessionId: sessionID,
 		Message:   "stream playback started",
 	}, nil
+}
+
+func (s *peerControlServer) StopStreamPlayback(ctx context.Context, req *control.StopStreamRequest) (*control.StopStreamResponse, error) {
+	sessionID := normalizeSessionID(req.GetSessionId())
+	reason := strings.TrimSpace(req.GetReason())
+	if reason == "" {
+		reason = "stop requested"
+	}
+
+	log.Printf("gRPC stream: StopStreamPlayback session=%q reason=%q leader=%v", sessionID, reason, s.isLeader)
+
+	if !s.isLeader {
+		log.Printf("gRPC stream: follower received stop for session=%q reason=%q", sessionID, reason)
+		stopped := s.cancelSession(sessionID)
+		if stopped {
+			s.finishSession(sessionID)
+			log.Printf("gRPC stream: follower stopped local session=%q", sessionID)
+			return &control.StopStreamResponse{Accepted: true, SessionId: sessionID, Message: "session stopped"}, nil
+		}
+		log.Printf("gRPC stream: follower had no active local session=%q to stop", sessionID)
+		return &control.StopStreamResponse{Accepted: false, SessionId: sessionID, Message: "session not active on follower"}, nil
+	}
+
+	fanoutCount := 0
+	stopErrors := 0
+	log.Printf("gRPC stream: leader beginning stop fanout for session=%q", sessionID)
+	for _, p := range s.pl.Peers() {
+		if p.ID == s.id || p.Role == models.RoleLeader {
+			continue
+		}
+
+		target := peerTarget(p.Address, s.grpcPort)
+		if target == "" {
+			log.Printf("gRPC stream: leader stop fanout skipping follower=%s due to empty target", p.ID)
+			continue
+		}
+		if target == fmt.Sprintf("127.0.0.1:%d", s.grpcPort) || target == fmt.Sprintf("localhost:%d", s.grpcPort) {
+			log.Printf("gRPC stream: leader stop fanout skipping self-target follower=%s target=%s", p.ID, target)
+			continue
+		}
+
+		fanoutCount++
+		log.Printf("gRPC stream: leader stop fanout sending follower=%s session=%q target=%s", p.ID, sessionID, target)
+		conn, err := grpc.NewClient(target, grpc.WithTransportCredentials(insecure.NewCredentials()))
+		if err != nil {
+			stopErrors++
+			log.Printf("gRPC stream: stop fanout connect failed follower=%s target=%s: %v", p.ID, target, err)
+			continue
+		}
+
+		client := control.NewPeerControlClient(conn)
+		rpcCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+		_, err = client.StopStreamPlayback(rpcCtx, &control.StopStreamRequest{SessionId: sessionID, Reason: reason})
+		cancel()
+		conn.Close()
+
+		if err != nil {
+			stopErrors++
+			log.Printf("gRPC stream: stop fanout failed follower=%s target=%s: %v", p.ID, target, err)
+			continue
+		}
+
+		log.Printf("gRPC stream: leader stop fanout acknowledged follower=%s session=%q", p.ID, sessionID)
+	}
+
+	if s.cancelSession(sessionID) {
+		s.finishSession(sessionID)
+		log.Printf("gRPC stream: leader stopped local session=%q", sessionID)
+	} else {
+		log.Printf("gRPC stream: leader had no active local session=%q to stop", sessionID)
+	}
+
+	msg := fmt.Sprintf("stop broadcast to %d follower(s)", fanoutCount)
+	if stopErrors > 0 {
+		msg = fmt.Sprintf("%s with %d error(s)", msg, stopErrors)
+	}
+	log.Printf("gRPC stream: leader completed stop fanout for session=%q followers=%d errors=%d", sessionID, fanoutCount, stopErrors)
+	return &control.StopStreamResponse{Accepted: stopErrors == 0, SessionId: sessionID, Message: msg}, nil
 }
 
 var sessionLease = 30 * time.Second
@@ -322,10 +412,53 @@ func (s *peerControlServer) finishSession(sessionID string) {
 	s.sessionMu.Lock()
 	defer s.sessionMu.Unlock()
 
-	if sessionID == "" {
-		sessionID = "default"
-	}
+	sessionID = normalizeSessionID(sessionID)
 	delete(s.activeSessions, sessionID)
+}
+
+func normalizeSessionID(sessionID string) string {
+	if strings.TrimSpace(sessionID) == "" {
+		return "default"
+	}
+	return strings.TrimSpace(sessionID)
+}
+
+func (s *peerControlServer) setSessionCancel(sessionID string, cancel context.CancelFunc) {
+	s.sessionMu.Lock()
+	defer s.sessionMu.Unlock()
+
+	if s.sessionCancels == nil {
+		s.sessionCancels = make(map[string]context.CancelFunc)
+	}
+	normalized := normalizeSessionID(sessionID)
+	s.sessionCancels[normalized] = cancel
+	log.Printf("gRPC stream: registered cancellable session=%q", normalized)
+}
+
+func (s *peerControlServer) clearSessionCancel(sessionID string) {
+	s.sessionMu.Lock()
+	defer s.sessionMu.Unlock()
+	normalized := normalizeSessionID(sessionID)
+	if _, ok := s.sessionCancels[normalized]; ok {
+		delete(s.sessionCancels, normalized)
+		log.Printf("gRPC stream: cleared cancellable session=%q", normalized)
+	}
+}
+
+func (s *peerControlServer) cancelSession(sessionID string) bool {
+	s.sessionMu.Lock()
+	defer s.sessionMu.Unlock()
+
+	normalized := normalizeSessionID(sessionID)
+	cancel, ok := s.sessionCancels[normalized]
+	if !ok {
+		log.Printf("gRPC stream: cancel requested for non-active session=%q", normalized)
+		return false
+	}
+	delete(s.sessionCancels, normalized)
+	log.Printf("gRPC stream: canceling active session=%q", normalized)
+	cancel()
+	return true
 }
 
 func streamTarget(ctx context.Context) string {
@@ -570,6 +703,10 @@ func (s *peerControlServer) receiveAudioFromLeader(ctx context.Context, target s
 			tempFile.Close()
 			if liveSink != nil {
 				disableLiveSink("stream receive error", err)
+			}
+			if errors.Is(err, context.Canceled) || status.Code(err) == codes.Canceled {
+				log.Printf("gRPC stream: receive loop canceled target=%s session=%q chunks_received=%d", target, req.SessionId, chunksReceived)
+				return err
 			}
 			log.Printf("gRPC stream: receive error target=%s session=%q chunks_received=%d: %v", target, req.SessionId, chunksReceived, err)
 			return err
