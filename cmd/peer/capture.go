@@ -3,14 +3,30 @@ package main
 import (
 	"fmt"
 	"io"
-	"os"
+	"log"
 	"os/exec"
+	"path/filepath"
 	"runtime"
+	"slices"
 	"sort"
 	"strings"
 
 	"silent/internal/control"
 )
+
+const (
+	streamSampleRate   = 48000
+	streamChannels     = 2
+	streamSampleFormat = "s16le"
+	streamChunkBytes   = 3840
+)
+
+type streamFormat struct {
+	SampleRate   int
+	Channels     int
+	SampleFormat string
+	ChunkBytes   int
+}
 
 func (s *peerControlServer) openStreamSource(req *control.StreamPlaybackRequest) (io.ReadCloser, string, func() error, error) {
 	if s.isLeader && s.liveCapture {
@@ -25,12 +41,12 @@ func (s *peerControlServer) openStreamSource(req *control.StreamPlaybackRequest)
 		return nil, "", nil, fmt.Errorf("audio_path is required when live capture is disabled")
 	}
 
-	f, err := os.Open(req.AudioPath)
+	rc, closeFn, err := startFilePCMSource(req.AudioPath)
 	if err != nil {
-		return nil, "", nil, fmt.Errorf("open audio file: %w", err)
+		return nil, "", nil, fmt.Errorf("start file audio source: %w", err)
 	}
 
-	return f, req.AudioPath, f.Close, nil
+	return rc, req.AudioPath, closeFn, nil
 }
 
 func startLiveCaptureSource(device string) (io.ReadCloser, func() error, error) {
@@ -43,44 +59,71 @@ func startLiveCaptureSource(device string) (io.ReadCloser, func() error, error) 
 	var args []string
 	switch runtime.GOOS {
 	case "linux":
-		args = []string{
-			"-hide_banner",
-			"-loglevel", "error",
+		args = append(args,
 			"-f", "pulse",
 			"-i", dev,
-			"-ac", "2",
-			"-ar", "48000",
-			"-f", "wav",
-			"pipe:1",
-		}
+		)
 	case "windows":
 		if dev == "default" {
 			return nil, nil, fmt.Errorf("windows capture format dshow requires an explicit capture-device (run: ffmpeg -list_devices true -f dshow -i dummy)")
 		}
 
-		args = []string{
-			"-hide_banner",
-			"-loglevel", "error",
+		args = append(args,
 			"-f", "dshow",
-			"-i", "audio=" + dev,
-			"-ac", "2",
-			"-ar", "48000",
-			"-f", "wav",
-			"pipe:1",
-		}
+			"-i", "audio="+dev,
+		)
 	default:
 		return nil, nil, fmt.Errorf("live capture is not supported on %s", runtime.GOOS)
 	}
 
+	args = appendPCMOutputArgs(args)
+
+	return startFFmpegPipe(args, dev)
+}
+
+func startFilePCMSource(audioPath string) (io.ReadCloser, func() error, error) {
+	if _, err := exec.LookPath("ffmpeg"); err != nil {
+		return nil, nil, fmt.Errorf("ffmpeg is required for file audio transcoding")
+	}
+
+	cleanPath := filepath.Clean(audioPath)
+	args := []string{
+		"-hide_banner",
+		"-loglevel", "error",
+		"-i", cleanPath,
+	}
+	args = appendPCMOutputArgs(args)
+
+	return startFFmpegPipe(args, cleanPath)
+}
+
+func appendPCMOutputArgs(args []string) []string {
+	return append(args,
+		"-vn",
+		"-sn",
+		"-dn",
+		"-ac", fmt.Sprintf("%d", streamChannels),
+		"-ar", fmt.Sprintf("%d", streamSampleRate),
+		"-f", streamSampleFormat,
+		"pipe:1",
+	)
+}
+
+func startFFmpegPipe(args []string, sourceName string) (io.ReadCloser, func() error, error) {
 	cmd := exec.Command("ffmpeg", args...)
+
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
+		logExecError("capture", cmd, "stdout-pipe", err)
 		return nil, nil, fmt.Errorf("ffmpeg stdout pipe: %w", err)
 	}
 
+	log.Printf("capture: source=%q", sourceName)
+	logExecStart("capture", cmd)
 	if err := cmd.Start(); err != nil {
+		logExecError("capture", cmd, "start", err)
 		_ = stdout.Close()
-		return nil, nil, fmt.Errorf("start ffmpeg capture for device %q: %w", dev, err)
+		return nil, nil, fmt.Errorf("start ffmpeg source %q: %w", sourceName, err)
 	}
 
 	closeAndWait := func() error {
@@ -88,10 +131,43 @@ func startLiveCaptureSource(device string) (io.ReadCloser, func() error, error) 
 		if cmd.Process != nil {
 			_ = cmd.Process.Kill()
 		}
-		return cmd.Wait()
+		err := cmd.Wait()
+		if err != nil {
+			logExecError("capture", cmd, "wait", err)
+		}
+		return err
 	}
 
 	return stdout, closeAndWait, nil
+}
+
+func defaultStreamFormat() streamFormat {
+	return streamFormat{
+		SampleRate:   streamSampleRate,
+		Channels:     streamChannels,
+		SampleFormat: streamSampleFormat,
+		ChunkBytes:   streamChunkBytes,
+	}
+}
+
+func normalizeStreamPlaybackRequest(req *control.StreamPlaybackRequest) streamFormat {
+	format := defaultStreamFormat()
+
+	if req.GetSampleRate() > 0 {
+		format.SampleRate = int(req.GetSampleRate())
+	}
+	if req.GetChannels() > 0 {
+		format.Channels = int(req.GetChannels())
+	}
+	if strings.TrimSpace(req.GetSampleFormat()) != "" {
+		format.SampleFormat = strings.TrimSpace(req.GetSampleFormat())
+	}
+
+	req.SampleRate = uint32(format.SampleRate)
+	req.Channels = uint32(format.Channels)
+	req.SampleFormat = format.SampleFormat
+
+	return format
 }
 
 func normalizeCaptureDevice(device string) string {
@@ -146,10 +222,8 @@ func validateCaptureDevice(device string) error {
 			}
 		}
 
-		for _, name := range known {
-			if name == dev {
-				return nil
-			}
+		if slices.Contains(known, dev) {
+			return nil
 		}
 
 		sort.Strings(known)

@@ -40,6 +40,9 @@ message StreamPlaybackRequest {
   string audio_path = 3;
   int64 shared_at_nanos = 4;
   bool relay = 5;
+  uint32 sample_rate = 6;
+  uint32 channels = 7;
+  string sample_format = 8;
 }
 
 message StreamPlaybackResponse {

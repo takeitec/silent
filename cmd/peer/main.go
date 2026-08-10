@@ -25,6 +25,7 @@ type config struct {
 	wavPath       string
 	liveCapture   bool
 	captureDevice string
+	logMediaCmds  bool
 	room          bool
 	roomURL       string
 	advertiseHost string
@@ -53,6 +54,7 @@ func parseFlags() config {
 	wavPath := flag.String("wav", "", "optional wav file to play")
 	liveCapture := flag.Bool("live-capture", true, "capture live system audio on leader instead of reading audio-path file")
 	captureDevice := flag.String("capture-device", "default", "system audio capture device (Linux PulseAudio/PipeWire monitor or Windows WASAPI endpoint, default auto device)")
+	logMediaCmds := flag.Bool("log-media-cmds", true, "log ffmpeg/ffplay/aplay commands before execution and on failures")
 	room := flag.Bool("room", true, "use room-based discovery instead of UDP broadcast")
 	roomURL := flag.String("room-url", "http://127.0.0.1:9100", "room service base URL")
 	advertiseHost := flag.String("advertise-host", "", "override the host advertised to other peers")
@@ -68,6 +70,7 @@ func parseFlags() config {
 		wavPath:       *wavPath,
 		liveCapture:   *liveCapture,
 		captureDevice: *captureDevice,
+		logMediaCmds:  *logMediaCmds,
 		room:          *room,
 		roomURL:       *roomURL,
 		advertiseHost: *advertiseHost,
@@ -168,6 +171,8 @@ func probePortForLeader(peer models.Peer, fallback int) int {
 
 func (a *peerApp) Run() error {
 	defer a.listener.Close()
+
+	setMediaCommandLoggingEnabled(a.cfg.logMediaCmds)
 
 	if err := validateMediaRuntime(a.cfg); err != nil {
 		return fmt.Errorf("media preflight failed: %w", err)
