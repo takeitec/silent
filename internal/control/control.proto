@@ -9,6 +9,7 @@ service PeerControl {
   rpc NotifyPlayback(PlaybackCommand) returns (PlaybackAck);
 
   rpc StartStreamPlayback(StreamPlaybackRequest) returns (StreamPlaybackResponse);
+  rpc JoinStreamPlayback(JoinStreamRequest) returns (JoinStreamResponse);
   rpc StopStreamPlayback(StopStreamRequest) returns (StopStreamResponse);
   rpc StreamAudio(StreamPlaybackRequest) returns (stream AudioChunk);
 }
@@ -50,6 +51,20 @@ message StreamPlaybackResponse {
   bool accepted = 1;
   string session_id = 2;
   string message = 3;
+}
+
+message JoinStreamRequest {
+  string session_id = 1;
+  string follower_id = 2;
+  int64 shared_at_nanos = 3;
+}
+
+message JoinStreamResponse {
+  bool accepted = 1;
+  string session_id = 2;
+  string message = 3;
+  uint32 attempted = 4;
+  uint32 succeeded = 5;
 }
 
 message StopStreamRequest {

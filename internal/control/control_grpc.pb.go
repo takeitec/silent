@@ -22,6 +22,7 @@ const (
 	PeerControl_StartPlayback_FullMethodName       = "/control.PeerControl/StartPlayback"
 	PeerControl_NotifyPlayback_FullMethodName      = "/control.PeerControl/NotifyPlayback"
 	PeerControl_StartStreamPlayback_FullMethodName = "/control.PeerControl/StartStreamPlayback"
+	PeerControl_JoinStreamPlayback_FullMethodName  = "/control.PeerControl/JoinStreamPlayback"
 	PeerControl_StopStreamPlayback_FullMethodName  = "/control.PeerControl/StopStreamPlayback"
 	PeerControl_StreamAudio_FullMethodName         = "/control.PeerControl/StreamAudio"
 )
@@ -33,6 +34,7 @@ type PeerControlClient interface {
 	StartPlayback(ctx context.Context, in *PlaybackRequest, opts ...grpc.CallOption) (*PlaybackResponse, error)
 	NotifyPlayback(ctx context.Context, in *PlaybackCommand, opts ...grpc.CallOption) (*PlaybackAck, error)
 	StartStreamPlayback(ctx context.Context, in *StreamPlaybackRequest, opts ...grpc.CallOption) (*StreamPlaybackResponse, error)
+	JoinStreamPlayback(ctx context.Context, in *JoinStreamRequest, opts ...grpc.CallOption) (*JoinStreamResponse, error)
 	StopStreamPlayback(ctx context.Context, in *StopStreamRequest, opts ...grpc.CallOption) (*StopStreamResponse, error)
 	StreamAudio(ctx context.Context, in *StreamPlaybackRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[AudioChunk], error)
 }
@@ -75,6 +77,16 @@ func (c *peerControlClient) StartStreamPlayback(ctx context.Context, in *StreamP
 	return out, nil
 }
 
+func (c *peerControlClient) JoinStreamPlayback(ctx context.Context, in *JoinStreamRequest, opts ...grpc.CallOption) (*JoinStreamResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(JoinStreamResponse)
+	err := c.cc.Invoke(ctx, PeerControl_JoinStreamPlayback_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *peerControlClient) StopStreamPlayback(ctx context.Context, in *StopStreamRequest, opts ...grpc.CallOption) (*StopStreamResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(StopStreamResponse)
@@ -111,6 +123,7 @@ type PeerControlServer interface {
 	StartPlayback(context.Context, *PlaybackRequest) (*PlaybackResponse, error)
 	NotifyPlayback(context.Context, *PlaybackCommand) (*PlaybackAck, error)
 	StartStreamPlayback(context.Context, *StreamPlaybackRequest) (*StreamPlaybackResponse, error)
+	JoinStreamPlayback(context.Context, *JoinStreamRequest) (*JoinStreamResponse, error)
 	StopStreamPlayback(context.Context, *StopStreamRequest) (*StopStreamResponse, error)
 	StreamAudio(*StreamPlaybackRequest, grpc.ServerStreamingServer[AudioChunk]) error
 	mustEmbedUnimplementedPeerControlServer()
@@ -131,6 +144,9 @@ func (UnimplementedPeerControlServer) NotifyPlayback(context.Context, *PlaybackC
 }
 func (UnimplementedPeerControlServer) StartStreamPlayback(context.Context, *StreamPlaybackRequest) (*StreamPlaybackResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method StartStreamPlayback not implemented")
+}
+func (UnimplementedPeerControlServer) JoinStreamPlayback(context.Context, *JoinStreamRequest) (*JoinStreamResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method JoinStreamPlayback not implemented")
 }
 func (UnimplementedPeerControlServer) StopStreamPlayback(context.Context, *StopStreamRequest) (*StopStreamResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method StopStreamPlayback not implemented")
@@ -213,6 +229,24 @@ func _PeerControl_StartStreamPlayback_Handler(srv interface{}, ctx context.Conte
 	return interceptor(ctx, in, info, handler)
 }
 
+func _PeerControl_JoinStreamPlayback_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(JoinStreamRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(PeerControlServer).JoinStreamPlayback(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: PeerControl_JoinStreamPlayback_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(PeerControlServer).JoinStreamPlayback(ctx, req.(*JoinStreamRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _PeerControl_StopStreamPlayback_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(StopStreamRequest)
 	if err := dec(in); err != nil {
@@ -260,6 +294,10 @@ var PeerControl_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "StartStreamPlayback",
 			Handler:    _PeerControl_StartStreamPlayback_Handler,
+		},
+		{
+			MethodName: "JoinStreamPlayback",
+			Handler:    _PeerControl_JoinStreamPlayback_Handler,
 		},
 		{
 			MethodName: "StopStreamPlayback",

@@ -50,6 +50,22 @@ func TestBeginSessionExpiresAfterLease(t *testing.T) {
 	}
 }
 
+func TestBeginSessionRejectsDuplicateWhenActiveCancelExists(t *testing.T) {
+	originalLease := sessionLease
+	defer func() { sessionLease = originalLease }()
+
+	sessionLease = 10 * time.Millisecond
+	srv := &peerControlServer{
+		sessionCancels: map[string]context.CancelFunc{
+			"demo-session": func() {},
+		},
+	}
+
+	if srv.beginSession("demo-session") {
+		t.Fatalf("expected duplicate session start to be rejected while active cancel exists")
+	}
+}
+
 func TestPeerTargetUsesAdvertisedPort(t *testing.T) {
 	got := peerTarget("192.168.1.10:50052", 50051)
 	if got != "192.168.1.10:50052" {

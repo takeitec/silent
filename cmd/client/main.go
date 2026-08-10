@@ -28,6 +28,7 @@ func main() {
 	audioID := fs.String("audio-id", "demo", "audio id")
 	audioPath := fs.String("audio-path", "demo.wav", "audio path")
 	sessionID := fs.String("session-id", fmt.Sprintf("session-%d", time.Now().Unix()), "stream session id")
+	followerID := fs.String("follower-id", "", "specific follower peer id for late join (optional)")
 	sharedAt := fs.Int64("shared-at-nanos", time.Now().Add(3*time.Second).UnixNano(), "shared playback time in nanoseconds")
 
 	if err := fs.Parse(args); err != nil {
@@ -77,6 +78,17 @@ func main() {
 		}
 		log.Printf("stop-stream accepted=%v session=%s message=%s", resp.Accepted, resp.SessionId, resp.Message)
 
+	case "join-stream":
+		resp, err := client.JoinStreamPlayback(context.Background(), &control.JoinStreamRequest{
+			SessionId:     *sessionID,
+			FollowerId:    *followerID,
+			SharedAtNanos: *sharedAt,
+		})
+		if err != nil {
+			log.Fatalf("join stream playback failed: %v", err)
+		}
+		log.Printf("join-stream accepted=%v session=%s attempted=%d succeeded=%d message=%s", resp.Accepted, resp.SessionId, resp.Attempted, resp.Succeeded, resp.Message)
+
 	default:
 		usage()
 		os.Exit(2)
@@ -87,6 +99,7 @@ func usage() {
 	fmt.Println("usage:")
 	fmt.Println("  client play [flags]")
 	fmt.Println("  client stream [flags]")
+	fmt.Println("  client join-stream [flags]")
 	fmt.Println("  client stop-stream [flags]")
 	fmt.Println("")
 	fmt.Println("flags:")
@@ -94,5 +107,6 @@ func usage() {
 	fmt.Println("  -audio-id string")
 	fmt.Println("  -audio-path string")
 	fmt.Println("  -session-id string")
+	fmt.Println("  -follower-id string")
 	fmt.Println("  -shared-at-nanos int")
 }
