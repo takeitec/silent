@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -37,11 +36,79 @@ type peerControlServer struct {
 	wavPath        string
 	liveCapture    bool
 	captureDevice  string
+	streamJitter   time.Duration
+	chunkLogStdoutMode string
+	chunkLogFileMode   string
+	chunkLogEvery      int
+	chunkLogFilePath   string
+	chunkLogFile       *os.File
+	chunkLogMu         stdsync.Mutex
 	offsetCh       chan time.Duration
 	sessionMu      stdsync.Mutex
 	activeSessions map[string]time.Time
 	sessionCancels map[string]context.CancelFunc
 	leaderStreams  map[string]*control.StreamPlaybackRequest
+}
+
+const (
+	chunkLogModeOff       = "off"
+	chunkLogModeMilestone = "milestone"
+	chunkLogModeAll       = "all"
+)
+
+func normalizeChunkLogMode(mode string) string {
+	switch strings.ToLower(strings.TrimSpace(mode)) {
+	case chunkLogModeOff, chunkLogModeMilestone, chunkLogModeAll:
+		return strings.ToLower(strings.TrimSpace(mode))
+	default:
+		return chunkLogModeMilestone
+	}
+}
+
+func (s *peerControlServer) shouldLogChunk(mode string, seq int64, size, expectedSize int) bool {
+	mode = normalizeChunkLogMode(mode)
+	if mode == chunkLogModeOff {
+		return false
+	}
+	if mode == chunkLogModeAll {
+		return true
+	}
+
+	every := s.chunkLogEvery
+	if every <= 0 {
+		every = 50
+	}
+	if seq%int64(every) == 0 {
+		return true
+	}
+	if expectedSize > 0 && size != expectedSize {
+		return true
+	}
+	return false
+}
+
+func (s *peerControlServer) logChunkEvent(direction, sessionID, target string, seq int64, size, expectedSize int, extra string) {
+	if !s.shouldLogChunk(s.chunkLogStdoutMode, seq, size, expectedSize) && !s.shouldLogChunk(s.chunkLogFileMode, seq, size, expectedSize) {
+		return
+	}
+
+	msg := fmt.Sprintf("gRPC stream: %s chunk seq=%d size=%d session=%q target=%s", direction, seq, size, sessionID, target)
+	if expectedSize > 0 && size != expectedSize {
+		msg = fmt.Sprintf("%s expected_size=%d", msg, expectedSize)
+	}
+	if strings.TrimSpace(extra) != "" {
+		msg = fmt.Sprintf("%s %s", msg, strings.TrimSpace(extra))
+	}
+
+	if s.shouldLogChunk(s.chunkLogStdoutMode, seq, size, expectedSize) {
+		log.Printf("%s", msg)
+	}
+
+	if s.shouldLogChunk(s.chunkLogFileMode, seq, size, expectedSize) && s.chunkLogFile != nil {
+		s.chunkLogMu.Lock()
+		_, _ = fmt.Fprintf(s.chunkLogFile, "%s %s\n", time.Now().Format(time.RFC3339Nano), msg)
+		s.chunkLogMu.Unlock()
+	}
 }
 
 func (s *peerControlServer) StartPlayback(ctx context.Context, req *control.PlaybackRequest) (*control.PlaybackResponse, error) {
@@ -671,13 +738,14 @@ func (s *peerControlServer) StreamAudio(req *control.StreamPlaybackRequest, stre
 	chunksSent := 0
 
 	for {
-		n, err := source.Read(buf)
+		n, err := io.ReadFull(source, buf)
 		if n > 0 {
 			chunk := &control.AudioChunk{
 				SessionId:   req.SessionId,
 				AudioId:     req.AudioId,
 				Sequence:    seq,
 				Data:        append([]byte(nil), buf[:n]...),
+				SentAtNanos: time.Now().UnixNano(),
 				EndOfStream: false,
 			}
 			if err := stream.Send(chunk); err != nil {
@@ -685,11 +753,11 @@ func (s *peerControlServer) StreamAudio(req *control.StreamPlaybackRequest, stre
 				return err
 			}
 			chunksSent++
-			log.Printf("gRPC stream: sent chunk seq=%d size=%d session=%q target=%s", seq, len(chunk.Data), req.SessionId, target)
+			s.logChunkEvent("sent", req.SessionId, target, seq, len(chunk.Data), streamFormat.ChunkBytes, "")
 			seq++
 		}
 
-		if err == io.EOF {
+		if err == io.EOF || err == io.ErrUnexpectedEOF {
 			break
 		}
 		if err != nil {
@@ -702,6 +770,7 @@ func (s *peerControlServer) StreamAudio(req *control.StreamPlaybackRequest, stre
 		SessionId:   req.SessionId,
 		AudioId:     req.AudioId,
 		Sequence:    seq,
+		SentAtNanos: time.Now().UnixNano(),
 		EndOfStream: true,
 	}
 	if err := stream.Send(finalChunk); err != nil {
@@ -739,9 +808,17 @@ func (s *peerControlServer) receiveAudioFromLeader(ctx context.Context, target s
 	}
 
 	localPlaybackAt := syncutil.ConvertSharedTimeToLocal(sharedAt, offset)
-	firstChunkLogged := false
+	playoutDelay := s.streamJitter
+	if playoutDelay <= 0 {
+		playoutDelay = 200 * time.Millisecond
+	}
+	chunkDur := streamChunkDuration(streamFormat)
+	silenceChunk := make([]byte, streamFormat.ChunkBytes)
 
 	chunksReceived := 0
+	firstChunkLogged := false
+	metrics := newStreamHealthMetrics(playoutDelay)
+
 	liveSink := io.WriteCloser(nil)
 	closeLiveSink := func() error { return nil }
 	liveLogPath := ""
@@ -819,104 +896,28 @@ func (s *peerControlServer) receiveAudioFromLeader(ctx context.Context, target s
 		return fmt.Errorf("%s", msg)
 	}
 
-	var liveBuffer bytes.Buffer
-	liveStarted := false
-
 	tempFile, err := os.CreateTemp("", fmt.Sprintf("silent-%s-%s-*.pcm", sanitizeForFilename(req.SessionId), sanitizeForFilename(req.AudioId)))
 	if err != nil {
 		log.Printf("gRPC stream: failed to create output file for session=%q: %v", req.SessionId, err)
 		return err
 	}
 	outputPath := tempFile.Name()
+	defer tempFile.Close()
 
-	for {
-		chunk, err := stream.Recv()
-		if err == io.EOF {
-			tempFile.Close()
-			log.Printf("gRPC stream: leader stream finished target=%s session=%q chunks_received=%d output=%s", target, req.SessionId, chunksReceived, outputPath)
-			if liveSink != nil {
-				if !liveStarted {
-					delay := time.Until(localPlaybackAt)
-					if delay > 0 {
-						time.Sleep(delay)
-					}
-					if liveBuffer.Len() > 0 {
-						if _, writeErr := liveSink.Write(liveBuffer.Bytes()); writeErr != nil {
-							disableLiveSink("buffer flush on EOF", writeErr)
-						}
-					}
-				}
-				if liveSink != nil {
-					go func() {
-						if err := closeLiveSink(); err != nil {
-							log.Printf("gRPC stream: live playback process ended with error for session=%q: %v", req.SessionId, err)
-						}
-					}()
-				}
-			} else {
-				go scheduleRawPlayback(localPlaybackAt, outputPath, streamFormat)
-			}
+	writeAudio := func(payload []byte, seq int64, source string) error {
+		if len(payload) == 0 {
 			return nil
 		}
-		if err != nil {
-			tempFile.Close()
-			if liveSink != nil {
-				disableLiveSink("stream receive error", err)
-			}
-			if errors.Is(err, context.Canceled) || status.Code(err) == codes.Canceled {
-				log.Printf("gRPC stream: receive loop canceled target=%s session=%q chunks_received=%d", target, req.SessionId, chunksReceived)
-				return err
-			}
-			log.Printf("gRPC stream: receive error target=%s session=%q chunks_received=%d: %v", target, req.SessionId, chunksReceived, err)
-			return err
-		}
-		if chunk.EndOfStream {
-			tempFile.Close()
-			log.Printf("gRPC stream: received final chunk target=%s session=%q chunks_received=%d output=%s", target, req.SessionId, chunksReceived, outputPath)
-			if liveSink != nil {
-				if !liveStarted {
-					delay := time.Until(localPlaybackAt)
-					if delay > 0 {
-						time.Sleep(delay)
-					}
-					if liveBuffer.Len() > 0 {
-						if _, writeErr := liveSink.Write(liveBuffer.Bytes()); writeErr != nil {
-							disableLiveSink("buffer flush on end-of-stream", writeErr)
-						}
-					}
-				}
-				if liveSink != nil {
-					go func() {
-						if err := closeLiveSink(); err != nil {
-							log.Printf("gRPC stream: live playback process ended with error for session=%q: %v", req.SessionId, err)
-						}
-					}()
-				}
-			} else {
-				go scheduleRawPlayback(localPlaybackAt, outputPath, streamFormat)
-			}
-			return nil
-		}
-
-		chunksReceived++
-		if !firstChunkLogged {
-			firstChunkLogged = true
-			now := time.Now()
-			log.Printf("gRPC stream: follower first chunk session=%q target=%s at=%s until_local_playback=%s", req.SessionId, target, now.Format(time.RFC3339Nano), time.Until(localPlaybackAt))
-		}
-		if _, err := tempFile.Write(chunk.Data); err != nil {
-			tempFile.Close()
+		if _, err := tempFile.Write(payload); err != nil {
 			if liveSink != nil {
 				disableLiveSink("temp file write error", err)
 			}
-			log.Printf("gRPC stream: failed to write chunk to %s: %v", outputPath, err)
-			return err
+			return fmt.Errorf("write chunk (%s) seq=%d to %s: %w", source, seq, outputPath, err)
 		}
 
 		if liveSink == nil && !restartAttempted {
-			attemptRestart("live sink unavailable before chunk write")
+			attemptRestart("live sink unavailable before playout")
 			if liveSink == nil {
-				tempFile.Close()
 				if err := failDueToLivePlayback("startup failure"); err != nil {
 					return err
 				}
@@ -924,40 +925,277 @@ func (s *peerControlServer) receiveAudioFromLeader(ctx context.Context, target s
 		}
 
 		if liveSink != nil {
-			now := time.Now()
-			if !liveStarted && now.Before(localPlaybackAt) {
-				if _, err := liveBuffer.Write(chunk.Data); err != nil {
-					log.Printf("gRPC stream: failed to buffer live chunk session=%q: %v", req.SessionId, err)
-				}
-			} else {
-				if !liveStarted {
-					if liveBuffer.Len() > 0 {
-						if _, err := liveSink.Write(liveBuffer.Bytes()); err != nil {
-							disableLiveSink("buffer flush", err)
-							attemptRestart("buffer flush")
-						}
-					}
-					if liveSink != nil {
-						liveStarted = true
-					}
-				}
-				if liveSink != nil {
-					if _, err := liveSink.Write(chunk.Data); err != nil {
-						disableLiveSink(fmt.Sprintf("live chunk write seq=%d", chunk.Sequence), err)
-						attemptRestart(fmt.Sprintf("live chunk write seq=%d", chunk.Sequence))
-						if liveSink == nil {
-							tempFile.Close()
-							if err := failDueToLivePlayback(fmt.Sprintf("chunk write seq=%d", chunk.Sequence)); err != nil {
-								return err
-							}
-						}
+			if _, err := liveSink.Write(payload); err != nil {
+				disableLiveSink(fmt.Sprintf("live write (%s) seq=%d", source, seq), err)
+				attemptRestart(fmt.Sprintf("live write (%s) seq=%d", source, seq))
+				if liveSink == nil {
+					if err := failDueToLivePlayback(fmt.Sprintf("live write (%s) seq=%d", source, seq)); err != nil {
+						return err
 					}
 				}
 			}
 		}
 
-		log.Printf("gRPC stream: received chunk seq=%d size=%d target=%s session=%q", chunk.Sequence, len(chunk.Data), target, req.SessionId)
+		return nil
 	}
+
+	type recvEnvelope struct {
+		chunk *control.AudioChunk
+		err   error
+		at    time.Time
+	}
+
+	recvCh := make(chan recvEnvelope, 32)
+	go func() {
+		defer close(recvCh)
+		for {
+			chunk, recvErr := stream.Recv()
+			recvCh <- recvEnvelope{chunk: chunk, err: recvErr, at: time.Now()}
+			if recvErr != nil {
+				return
+			}
+			if chunk.GetEndOfStream() {
+				return
+			}
+		}
+	}()
+
+	pending := make(map[int64][]byte)
+	initialized := false
+	playoutStarted := false
+	requestedStart := !sharedAt.IsZero() && req.GetSharedAtNanos() > 0
+	startAt := time.Time{}
+	nextPlayoutAt := time.Time{}
+	expectedSeq := int64(0)
+	endSeq := int64(-1)
+	eosSeen := false
+	lastChunkAt := time.Time{}
+	lastStallLogAt := time.Time{}
+	lastHealthLogAt := time.Now()
+
+	const maxPlayoutStepsPerDrain = 8
+	const receiveStallLogInterval = 2 * time.Second
+	const healthLogInterval = 5 * time.Second
+
+	logHealth := func(stage string) {
+		log.Printf("gRPC stream: health stage=%s session=%q target=%s received=%d played=%d late_dropped=%d duplicate_dropped=%d underflows=%d gap_silence=%d catchup_resyncs=%d buffered=%d expected_seq=%d one_way=%s",
+			stage,
+			req.SessionId,
+			target,
+			metrics.ReceivedChunks,
+			metrics.PlayedChunks,
+			metrics.LateDropped,
+			metrics.DuplicateDropped,
+			metrics.Underflows,
+			metrics.GapFillSilence,
+			metrics.CatchupResyncs,
+			len(pending),
+			expectedSeq,
+			metrics.OneWaySummary(),
+		)
+	}
+
+	tickerPeriod := chunkDur / 4
+	if tickerPeriod < 5*time.Millisecond {
+		tickerPeriod = 5 * time.Millisecond
+	}
+	ticker := time.NewTicker(tickerPeriod)
+	defer ticker.Stop()
+
+	drainReady := func(now time.Time) error {
+		if !initialized {
+			return nil
+		}
+		if !playoutStarted {
+			if now.Before(startAt) {
+				return nil
+			}
+			playoutStarted = true
+			nextPlayoutAt = startAt
+			log.Printf("gRPC stream: playout started session=%q target=%s start_at=%s jitter_delay=%s requested_start=%v", req.SessionId, target, startAt.Format(time.RFC3339Nano), playoutDelay, requestedStart)
+		}
+
+		steps := 0
+		for !nextPlayoutAt.After(now) {
+			steps++
+			if steps > maxPlayoutStepsPerDrain {
+				metrics.CatchupResyncs++
+				nextPlayoutAt = now.Add(chunkDur)
+				log.Printf("gRPC stream: playout catch-up limited session=%q target=%s expected_seq=%d pending=%d", req.SessionId, target, expectedSeq, len(pending))
+				break
+			}
+
+			if data, ok := pending[expectedSeq]; ok {
+				delete(pending, expectedSeq)
+				metrics.PlayedChunks++
+				if err := writeAudio(data, expectedSeq, "chunk"); err != nil {
+					return err
+				}
+			} else {
+				metrics.Underflows++
+				metrics.GapFillSilence++
+				if err := writeAudio(silenceChunk, expectedSeq, "silence-gap"); err != nil {
+					return err
+				}
+			}
+
+			expectedSeq++
+			nextPlayoutAt = nextPlayoutAt.Add(chunkDur)
+
+			if eosSeen && expectedSeq > endSeq && len(pending) == 0 {
+				return nil
+			}
+		}
+
+		return nil
+	}
+
+	for {
+		if eosSeen && initialized && playoutStarted && expectedSeq > endSeq && len(pending) == 0 {
+			break
+		}
+
+		select {
+		case <-ticker.C:
+			now := time.Now()
+			if now.Sub(lastHealthLogAt) >= healthLogInterval {
+				lastHealthLogAt = now
+				logHealth("periodic")
+			}
+			if playoutStarted && !lastChunkAt.IsZero() && time.Since(lastChunkAt) >= receiveStallLogInterval && time.Since(lastStallLogAt) >= receiveStallLogInterval {
+				lastStallLogAt = time.Now()
+				log.Printf("gRPC stream: no chunks received for %s session=%q target=%s pending=%d expected_seq=%d", time.Since(lastChunkAt).Truncate(time.Millisecond), req.SessionId, target, len(pending), expectedSeq)
+			}
+			if err := drainReady(now); err != nil {
+				logHealth("drain-error")
+				return err
+			}
+
+		case env, ok := <-recvCh:
+			if !ok {
+				if err := drainReady(time.Now()); err != nil {
+					logHealth("drain-error")
+					return err
+				}
+				if eosSeen {
+					for initialized && expectedSeq <= endSeq {
+						if err := drainReady(time.Now().Add(chunkDur)); err != nil {
+							logHealth("drain-error")
+							return err
+						}
+					}
+					break
+				}
+				log.Printf("gRPC stream: receive channel closed without end-of-stream session=%q target=%s chunks_received=%d", req.SessionId, target, chunksReceived)
+				logHealth("channel-closed")
+				return io.EOF
+			}
+
+			if env.err != nil {
+				if liveSink != nil {
+					disableLiveSink("stream receive error", env.err)
+				}
+				if errors.Is(env.err, context.Canceled) || status.Code(env.err) == codes.Canceled {
+					log.Printf("gRPC stream: receive loop canceled target=%s session=%q chunks_received=%d", target, req.SessionId, chunksReceived)
+					logHealth("canceled")
+					return env.err
+				}
+				if errors.Is(env.err, io.EOF) {
+					eosSeen = true
+					if initialized {
+						endSeq = expectedSeq + int64(len(pending))
+					}
+					continue
+				}
+				log.Printf("gRPC stream: receive error target=%s session=%q chunks_received=%d: %v", target, req.SessionId, chunksReceived, env.err)
+				logHealth("recv-error")
+				return env.err
+			}
+
+			chunk := env.chunk
+			if chunk == nil {
+				continue
+			}
+
+			if chunk.GetEndOfStream() {
+				eosSeen = true
+				endSeq = chunk.GetSequence() - 1
+				log.Printf("gRPC stream: received final chunk target=%s session=%q final_seq=%d chunks_received=%d", target, req.SessionId, chunk.GetSequence(), chunksReceived)
+				continue
+			}
+
+			chunksReceived++
+			metrics.ReceivedChunks++
+			lastChunkAt = env.at
+			if !firstChunkLogged {
+				firstChunkLogged = true
+				firstArrival := env.at
+				startAt = firstArrival.Add(playoutDelay)
+				if requestedStart && localPlaybackAt.After(startAt) {
+					startAt = localPlaybackAt
+				}
+				if requestedStart {
+					log.Printf("gRPC stream: follower first chunk session=%q target=%s at=%s requested_local_playback=%s chosen_playout_start=%s", req.SessionId, target, firstArrival.Format(time.RFC3339Nano), localPlaybackAt.Format(time.RFC3339Nano), startAt.Format(time.RFC3339Nano))
+				} else {
+					log.Printf("gRPC stream: follower first chunk session=%q target=%s at=%s chosen_playout_start=%s", req.SessionId, target, firstArrival.Format(time.RFC3339Nano), startAt.Format(time.RFC3339Nano))
+				}
+			}
+
+			if !initialized {
+				expectedSeq = chunk.GetSequence()
+				initialized = true
+			}
+
+			if chunk.GetSentAtNanos() > 0 {
+				sentLocal := syncutil.ConvertSharedTimeToLocal(time.Unix(0, chunk.GetSentAtNanos()), offset)
+				oneWay := env.at.Sub(sentLocal)
+				if oneWay >= 0 {
+					metrics.ObserveOneWay(oneWay)
+				}
+			}
+
+			seq := chunk.GetSequence()
+			if seq < expectedSeq {
+				metrics.LateDropped++
+				continue
+			}
+			if _, exists := pending[seq]; exists {
+				metrics.DuplicateDropped++
+				continue
+			}
+			pending[seq] = append([]byte(nil), chunk.GetData()...)
+			if depth := len(pending); depth > metrics.MaxBufferedChunks {
+				metrics.MaxBufferedChunks = depth
+			}
+
+			if err := drainReady(env.at); err != nil {
+				logHealth("drain-error")
+				return err
+			}
+
+			extra := fmt.Sprintf("buffered=%d", len(pending))
+			s.logChunkEvent("buffered", req.SessionId, target, seq, len(chunk.GetData()), streamFormat.ChunkBytes, extra)
+		}
+	}
+
+	logHealth("completed")
+
+	if liveSink != nil {
+		go func() {
+			if err := closeLiveSink(); err != nil {
+				log.Printf("gRPC stream: live playback process ended with error for session=%q: %v", req.SessionId, err)
+			}
+		}()
+	} else {
+		playAt := startAt
+		if playAt.IsZero() {
+			playAt = time.Now()
+		}
+		go scheduleRawPlayback(playAt, outputPath, streamFormat)
+	}
+
+	log.Printf("gRPC stream: leader stream finished target=%s session=%q chunks_received=%d output=%s", target, req.SessionId, chunksReceived, outputPath)
+	return nil
 }
 
 func (s *peerControlServer) streamAudioToPeer(ctx context.Context, target, sessionID, audioID, audioPath string, sharedAt time.Time) error {

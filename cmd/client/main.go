@@ -29,7 +29,7 @@ func main() {
 	audioPath := fs.String("audio-path", "demo.wav", "audio path")
 	sessionID := fs.String("session-id", fmt.Sprintf("session-%d", time.Now().Unix()), "stream session id")
 	followerID := fs.String("follower-id", "", "specific follower peer id for late join (optional)")
-	sharedAt := fs.Int64("shared-at-nanos", time.Now().Add(3*time.Second).UnixNano(), "shared playback time in nanoseconds")
+	sharedAt := fs.Int64("shared-at-nanos", 0, "shared playback time in nanoseconds (<=0 means immediate jitter-buffered start)")
 
 	if err := fs.Parse(args); err != nil {
 		log.Fatalf("parse flags: %v", err)

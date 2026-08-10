@@ -660,6 +660,7 @@ type AudioChunk struct {
 	Sequence      int64                  `protobuf:"varint,3,opt,name=sequence,proto3" json:"sequence,omitempty"`
 	Data          []byte                 `protobuf:"bytes,4,opt,name=data,proto3" json:"data,omitempty"`
 	EndOfStream   bool                   `protobuf:"varint,5,opt,name=end_of_stream,json=endOfStream,proto3" json:"end_of_stream,omitempty"`
+	SentAtNanos   int64                  `protobuf:"varint,6,opt,name=sent_at_nanos,json=sentAtNanos,proto3" json:"sent_at_nanos,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -729,6 +730,13 @@ func (x *AudioChunk) GetEndOfStream() bool {
 	return false
 }
 
+func (x *AudioChunk) GetSentAtNanos() int64 {
+	if x != nil {
+		return x.SentAtNanos
+	}
+	return 0
+}
+
 var File_internal_control_control_proto protoreflect.FileDescriptor
 
 const file_internal_control_control_proto_rawDesc = "" +
@@ -788,7 +796,7 @@ const file_internal_control_control_proto_rawDesc = "" +
 	"\baccepted\x18\x01 \x01(\bR\baccepted\x12\x1d\n" +
 	"\n" +
 	"session_id\x18\x02 \x01(\tR\tsessionId\x12\x18\n" +
-	"\amessage\x18\x03 \x01(\tR\amessage\"\x9a\x01\n" +
+	"\amessage\x18\x03 \x01(\tR\amessage\"\xbe\x01\n" +
 	"\n" +
 	"AudioChunk\x12\x1d\n" +
 	"\n" +
@@ -796,7 +804,8 @@ const file_internal_control_control_proto_rawDesc = "" +
 	"\baudio_id\x18\x02 \x01(\tR\aaudioId\x12\x1a\n" +
 	"\bsequence\x18\x03 \x01(\x03R\bsequence\x12\x12\n" +
 	"\x04data\x18\x04 \x01(\fR\x04data\x12\"\n" +
-	"\rend_of_stream\x18\x05 \x01(\bR\vendOfStream2\xd1\x03\n" +
+	"\rend_of_stream\x18\x05 \x01(\bR\vendOfStream\x12\"\n" +
+	"\rsent_at_nanos\x18\x06 \x01(\x03R\vsentAtNanos2\xd1\x03\n" +
 	"\vPeerControl\x12D\n" +
 	"\rStartPlayback\x12\x18.control.PlaybackRequest\x1a\x19.control.PlaybackResponse\x12@\n" +
 	"\x0eNotifyPlayback\x12\x18.control.PlaybackCommand\x1a\x14.control.PlaybackAck\x12V\n" +

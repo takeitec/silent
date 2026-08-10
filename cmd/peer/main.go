@@ -7,6 +7,9 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"sort"
+	"strings"
 	"syscall"
 	"time"
 
@@ -16,19 +19,24 @@ import (
 )
 
 type config struct {
-	id            string
-	broadcastIP   string
-	port          int
-	controlPort   int
-	grpcPort      int
-	leader        bool
-	wavPath       string
-	liveCapture   bool
-	captureDevice string
-	logMediaCmds  bool
-	room          bool
-	roomURL       string
-	advertiseHost string
+	id                 string
+	broadcastIP        string
+	port               int
+	controlPort        int
+	grpcPort           int
+	leader             bool
+	wavPath            string
+	liveCapture        bool
+	captureDevice      string
+	logMediaCmds       bool
+	streamJitter       time.Duration
+	chunkLogStdoutMode string
+	chunkLogFileMode   string
+	chunkLogDir        string
+	chunkLogEvery      int
+	room               bool
+	roomURL            string
+	advertiseHost      string
 }
 
 func main() {
@@ -55,25 +63,48 @@ func parseFlags() config {
 	liveCapture := flag.Bool("live-capture", true, "capture live system audio on leader instead of reading audio-path file")
 	captureDevice := flag.String("capture-device", "default", "system audio capture device (Linux PulseAudio/PipeWire monitor or Windows WASAPI endpoint, default auto device)")
 	logMediaCmds := flag.Bool("log-media-cmds", true, "log ffmpeg/ffplay/aplay commands before execution and on failures")
+	streamJitterMS := flag.Int("stream-jitter-ms", 200, "target jitter buffer delay for streamed playback in milliseconds")
+	chunkLogStdoutMode := flag.String("stream-chunk-log-stdout", "milestone", "chunk log verbosity to stdout: off|milestone|all")
+	chunkLogFileMode := flag.String("stream-chunk-log-file", "all", "chunk log verbosity to file: off|milestone|all")
+	chunkLogDir := flag.String("stream-chunk-log-dir", "logs", "directory for stream chunk log files")
+	chunkLogEvery := flag.Int("stream-chunk-log-every", 50, "milestone interval for stream chunk logs")
 	room := flag.Bool("room", true, "use room-based discovery instead of UDP broadcast")
 	roomURL := flag.String("room-url", "http://127.0.0.1:9100", "room service base URL")
 	advertiseHost := flag.String("advertise-host", "", "override the host advertised to other peers")
 	flag.Parse()
 
+	jitter := time.Duration(*streamJitterMS) * time.Millisecond
+	if jitter < 50*time.Millisecond {
+		jitter = 50 * time.Millisecond
+	}
+	if jitter > 1000*time.Millisecond {
+		jitter = 1000 * time.Millisecond
+	}
+
+	every := *chunkLogEvery
+	if every <= 0 {
+		every = 50
+	}
+
 	return config{
-		id:            *id,
-		broadcastIP:   *broadcastIP,
-		port:          *port,
-		controlPort:   *controlPortFlag,
-		grpcPort:      *grpcPort,
-		leader:        *leader,
-		wavPath:       *wavPath,
-		liveCapture:   *liveCapture,
-		captureDevice: *captureDevice,
-		logMediaCmds:  *logMediaCmds,
-		room:          *room,
-		roomURL:       *roomURL,
-		advertiseHost: *advertiseHost,
+		id:                 *id,
+		broadcastIP:        *broadcastIP,
+		port:               *port,
+		controlPort:        *controlPortFlag,
+		grpcPort:           *grpcPort,
+		leader:             *leader,
+		wavPath:            *wavPath,
+		liveCapture:        *liveCapture,
+		captureDevice:      *captureDevice,
+		logMediaCmds:       *logMediaCmds,
+		streamJitter:       jitter,
+		chunkLogStdoutMode: *chunkLogStdoutMode,
+		chunkLogFileMode:   *chunkLogFileMode,
+		chunkLogDir:        *chunkLogDir,
+		chunkLogEvery:      every,
+		room:               *room,
+		roomURL:            *roomURL,
+		advertiseHost:      *advertiseHost,
 	}
 }
 
@@ -123,6 +154,29 @@ func newPeerApp(cfg config) (*peerApp, error) {
 
 	offsetCh := make(chan time.Duration, 1)
 
+	chunkLogFilePath := ""
+	var chunkLogFile *os.File
+	fileMode := normalizeChunkLogMode(cfg.chunkLogFileMode)
+	if fileMode != chunkLogModeOff {
+		logDir := cfg.chunkLogDir
+		if logDir == "" {
+			logDir = "logs"
+		}
+		if err := os.MkdirAll(logDir, 0o755); err != nil {
+			log.Printf("chunk log: failed to create log directory %q: %v", logDir, err)
+		} else {
+			chunkLogFilePath = filepath.Join(logDir, fmt.Sprintf("silent-stream-chunks-%s.log", sanitizeForFilename(cfg.id)))
+			f, err := os.OpenFile(chunkLogFilePath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+			if err != nil {
+				log.Printf("chunk log: failed to open file %q: %v", chunkLogFilePath, err)
+				chunkLogFilePath = ""
+			} else {
+				chunkLogFile = f
+				log.Printf("chunk log: file=%s mode=%s", chunkLogFilePath, fileMode)
+			}
+		}
+	}
+
 	return &peerApp{
 		cfg:      cfg,
 		pl:       pl,
@@ -130,14 +184,20 @@ func newPeerApp(cfg config) (*peerApp, error) {
 		listener: listener,
 		offsetCh: offsetCh,
 		grpcServer: &peerControlServer{
-			id:            cfg.id,
-			isLeader:      cfg.leader,
-			pl:            pl,
-			grpcPort:      cfg.grpcPort,
-			wavPath:       cfg.wavPath,
-			liveCapture:   cfg.liveCapture,
-			captureDevice: cfg.captureDevice,
-			offsetCh:      offsetCh,
+			id:                 cfg.id,
+			isLeader:           cfg.leader,
+			pl:                 pl,
+			grpcPort:           cfg.grpcPort,
+			wavPath:            cfg.wavPath,
+			liveCapture:        cfg.liveCapture,
+			captureDevice:      cfg.captureDevice,
+			streamJitter:       cfg.streamJitter,
+			chunkLogStdoutMode: normalizeChunkLogMode(cfg.chunkLogStdoutMode),
+			chunkLogFileMode:   fileMode,
+			chunkLogEvery:      cfg.chunkLogEvery,
+			chunkLogFilePath:   chunkLogFilePath,
+			chunkLogFile:       chunkLogFile,
+			offsetCh:           offsetCh,
 		},
 	}, nil
 }
@@ -171,6 +231,9 @@ func probePortForLeader(peer models.Peer, fallback int) int {
 
 func (a *peerApp) Run() error {
 	defer a.listener.Close()
+	if a.grpcServer != nil && a.grpcServer.chunkLogFile != nil {
+		defer a.grpcServer.chunkLogFile.Close()
+	}
 
 	setMediaCommandLoggingEnabled(a.cfg.logMediaCmds)
 
@@ -225,6 +288,8 @@ func (a *peerApp) Run() error {
 
 			ticker := time.NewTicker(2 * time.Second)
 			defer ticker.Stop()
+			lastRoomStateSig := ""
+			lastLeaderInfo := ""
 
 			for range ticker.C {
 				state, err := a.roomClient.RoomState()
@@ -233,7 +298,29 @@ func (a *peerApp) Run() error {
 					continue
 				}
 
-				log.Printf("room state: leader=%s peers=%d", state.Leader, len(state.Peers))
+				peerSigs := make([]string, 0, len(state.Peers))
+				currentLeaderInfo := ""
+				for _, p := range state.Peers {
+					peerSigs = append(peerSigs, fmt.Sprintf("%s|%s|%s|%d", p.ID, p.Role, p.Address, p.ControlPort))
+					if p.ID == state.Leader || strings.EqualFold(p.Role, string(models.RoleLeader)) {
+						currentLeaderInfo = fmt.Sprintf("%s|%s", p.ID, p.Address)
+					}
+				}
+				sort.Strings(peerSigs)
+				roomStateSig := fmt.Sprintf("leader=%s peers=%d [%s]", state.Leader, len(state.Peers), strings.Join(peerSigs, ","))
+
+				if roomStateSig != lastRoomStateSig {
+					log.Printf("room state: leader=%s peers=%d", state.Leader, len(state.Peers))
+					lastRoomStateSig = roomStateSig
+				}
+				if currentLeaderInfo != "" && currentLeaderInfo != lastLeaderInfo {
+					parts := strings.SplitN(currentLeaderInfo, "|", 2)
+					if len(parts) == 2 {
+						log.Printf("leader is %s at %s", parts[0], parts[1])
+					}
+					lastLeaderInfo = currentLeaderInfo
+				}
+
 				a.pl.Reset()
 				for _, p := range state.Peers {
 					role := models.Role(p.Role)
@@ -241,9 +328,6 @@ func (a *peerApp) Run() error {
 						continue
 					}
 					a.pl.Add(p.ID, p.Address, role, p.ControlPort)
-					if role == models.RoleLeader {
-						log.Printf("leader is %s at %s", p.ID, p.Address)
-					}
 				}
 			}
 		}()
@@ -258,17 +342,29 @@ func (a *peerApp) Run() error {
 
 		ticker := time.NewTicker(2 * time.Second)
 		defer ticker.Stop()
+		lastLeaderDiscovery := ""
 
 		for range ticker.C {
 			leader := a.pl.Leader()
+			currentLeaderDiscovery := ""
+			if leader != nil {
+				currentLeaderDiscovery = fmt.Sprintf("%s|%s", leader.ID, leader.Address)
+			}
+
 			if !shouldProbeLeader(a.cfg, leader) {
 				if leader == nil {
-					log.Printf("follower %s has not discovered a leader yet", a.cfg.id)
+					if lastLeaderDiscovery != "" {
+						log.Printf("follower %s has not discovered a leader yet", a.cfg.id)
+					}
+					lastLeaderDiscovery = ""
 				}
 				continue
 			}
 
-			log.Printf("follower %s discovered leader %s at %s", a.cfg.id, leader.ID, leader.Address)
+			if currentLeaderDiscovery != lastLeaderDiscovery {
+				log.Printf("follower %s discovered leader %s at %s", a.cfg.id, leader.ID, leader.Address)
+				lastLeaderDiscovery = currentLeaderDiscovery
+			}
 			if err := probeLeader(*leader, a.cfg.id, probePortForLeader(*leader, effectiveControlPort(a.cfg)), a.offsetCh); err != nil {
 				log.Printf("clock sync failed: %v", err)
 			}
