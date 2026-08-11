@@ -62,7 +62,7 @@ func scheduleRawPlayback(at time.Time, audioPath string, format streamFormat) {
 	}
 
 	if _, err := exec.LookPath("ffplay"); err == nil {
-		args := []string{"-nodisp", "-autoexit", "-loglevel", "error", "-f", format.SampleFormat, "-ar", fmt.Sprintf("%d", format.SampleRate)}
+		args := ffplayLowLatencyArgs(format)
 		args = append(args, ffplayChannelArgs(format.Channels)...)
 		args = append(args, audioPath)
 		cmd := exec.Command("ffplay", args...)
@@ -103,7 +103,7 @@ func startStreamingPlaybackWithFormatAndLog(format streamFormat, sessionID strin
 		return nil, nil, "", fmt.Errorf("create ffplay log file: %w", err)
 	}
 
-	args := []string{"-nodisp", "-autoexit", "-loglevel", "error", "-f", format.SampleFormat, "-ar", fmt.Sprintf("%d", format.SampleRate)}
+	args := ffplayLowLatencyArgs(format)
 	args = append(args, ffplayChannelArgs(format.Channels)...)
 	args = append(args, "-i", "pipe:0")
 	cmd := exec.Command("ffplay", args...)
@@ -134,6 +134,31 @@ func startStreamingPlaybackWithFormatAndLog(format streamFormat, sessionID strin
 	}
 
 	return stdin, closeAndWait, logPath, nil
+}
+
+func ffplayLowLatencyArgs(format streamFormat) []string {
+	return []string{
+		"-nodisp",
+		"-autoexit",
+		"-loglevel", "error",
+		"-fflags", "nobuffer",
+		"-flags", "low_delay",
+		"-probesize", "32",
+		"-analyzeduration", "0",
+		"-sync", "ext",
+		"-f", format.SampleFormat,
+		"-ar", fmt.Sprintf("%d", format.SampleRate),
+	}
+}
+
+func ffplayNormalLatencyArgs(format streamFormat) []string {
+	return []string{
+		"-nodisp",
+		"-autoexit",
+		"-loglevel", "error",
+		"-f", format.SampleFormat,
+		"-ar", fmt.Sprintf("%d", format.SampleRate),
+	}
 }
 
 func ffplayLogPath(sessionID string) string {
