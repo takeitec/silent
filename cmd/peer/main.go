@@ -19,24 +19,28 @@ import (
 )
 
 type config struct {
-	id                 string
-	broadcastIP        string
-	port               int
-	controlPort        int
-	grpcPort           int
-	leader             bool
-	wavPath            string
-	liveCapture        bool
-	captureDevice      string
-	logMediaCmds       bool
-	streamJitter       time.Duration
-	chunkLogStdoutMode string
-	chunkLogFileMode   string
-	chunkLogDir        string
-	chunkLogEvery      int
-	room               bool
-	roomURL            string
-	advertiseHost      string
+	id                   string
+	broadcastIP          string
+	port                 int
+	controlPort          int
+	grpcPort             int
+	leader               bool
+	wavPath              string
+	liveCapture          bool
+	captureDevice        string
+	logMediaCmds         bool
+	streamJitter         time.Duration
+	streamJitterAdaptive bool
+	streamJitterMin      time.Duration
+	streamJitterMax      time.Duration
+	streamJitterStep     time.Duration
+	chunkLogStdoutMode   string
+	chunkLogFileMode     string
+	chunkLogDir          string
+	chunkLogEvery        int
+	room                 bool
+	roomURL              string
+	advertiseHost        string
 }
 
 func main() {
@@ -64,10 +68,14 @@ func parseFlags() config {
 	captureDevice := flag.String("capture-device", "default", "system audio capture device (Linux PulseAudio/PipeWire monitor or Windows WASAPI endpoint, default auto device)")
 	logMediaCmds := flag.Bool("log-media-cmds", true, "log ffmpeg/ffplay/aplay commands before execution and on failures")
 	streamJitterMS := flag.Int("stream-jitter-ms", 200, "target jitter buffer delay for streamed playback in milliseconds")
+	streamJitterAdaptive := flag.Bool("stream-jitter-adaptive", true, "adapt jitter buffer delay at runtime based on stream health")
+	streamJitterMinMS := flag.Int("stream-jitter-min-ms", 50, "minimum adaptive jitter delay in milliseconds")
+	streamJitterMaxMS := flag.Int("stream-jitter-max-ms", 400, "maximum adaptive jitter delay in milliseconds")
+	streamJitterStepMS := flag.Int("stream-jitter-step-ms", 20, "adaptive jitter adjustment step in milliseconds")
 	chunkLogStdoutMode := flag.String("stream-chunk-log-stdout", "milestone", "chunk log verbosity to stdout: off|milestone|all")
 	chunkLogFileMode := flag.String("stream-chunk-log-file", "all", "chunk log verbosity to file: off|milestone|all")
 	chunkLogDir := flag.String("stream-chunk-log-dir", "logs", "directory for stream chunk log files")
-	chunkLogEvery := flag.Int("stream-chunk-log-every", 50, "milestone interval for stream chunk logs")
+	chunkLogEvery := flag.Int("stream-chunk-log-every", 100, "milestone interval for stream chunk logs")
 	room := flag.Bool("room", true, "use room-based discovery instead of UDP broadcast")
 	roomURL := flag.String("room-url", "http://127.0.0.1:9100", "room service base URL")
 	advertiseHost := flag.String("advertise-host", "", "override the host advertised to other peers")
@@ -81,30 +89,50 @@ func parseFlags() config {
 		jitter = 1000 * time.Millisecond
 	}
 
+	adaptiveMin := time.Duration(*streamJitterMinMS) * time.Millisecond
+	adaptiveMax := time.Duration(*streamJitterMaxMS) * time.Millisecond
+	adaptiveStep := time.Duration(*streamJitterStepMS) * time.Millisecond
+	if adaptiveMin < 50*time.Millisecond {
+		adaptiveMin = 50 * time.Millisecond
+	}
+	if adaptiveMax < adaptiveMin {
+		adaptiveMax = adaptiveMin
+	}
+	if adaptiveMax > 1500*time.Millisecond {
+		adaptiveMax = 1500 * time.Millisecond
+	}
+	if adaptiveStep <= 0 {
+		adaptiveStep = 20 * time.Millisecond
+	}
+
 	every := *chunkLogEvery
 	if every <= 0 {
 		every = 50
 	}
 
 	return config{
-		id:                 *id,
-		broadcastIP:        *broadcastIP,
-		port:               *port,
-		controlPort:        *controlPortFlag,
-		grpcPort:           *grpcPort,
-		leader:             *leader,
-		wavPath:            *wavPath,
-		liveCapture:        *liveCapture,
-		captureDevice:      *captureDevice,
-		logMediaCmds:       *logMediaCmds,
-		streamJitter:       jitter,
-		chunkLogStdoutMode: *chunkLogStdoutMode,
-		chunkLogFileMode:   *chunkLogFileMode,
-		chunkLogDir:        *chunkLogDir,
-		chunkLogEvery:      every,
-		room:               *room,
-		roomURL:            *roomURL,
-		advertiseHost:      *advertiseHost,
+		id:                   *id,
+		broadcastIP:          *broadcastIP,
+		port:                 *port,
+		controlPort:          *controlPortFlag,
+		grpcPort:             *grpcPort,
+		leader:               *leader,
+		wavPath:              *wavPath,
+		liveCapture:          *liveCapture,
+		captureDevice:        *captureDevice,
+		logMediaCmds:         *logMediaCmds,
+		streamJitter:         jitter,
+		streamJitterAdaptive: *streamJitterAdaptive,
+		streamJitterMin:      adaptiveMin,
+		streamJitterMax:      adaptiveMax,
+		streamJitterStep:     adaptiveStep,
+		chunkLogStdoutMode:   *chunkLogStdoutMode,
+		chunkLogFileMode:     *chunkLogFileMode,
+		chunkLogDir:          *chunkLogDir,
+		chunkLogEvery:        every,
+		room:                 *room,
+		roomURL:              *roomURL,
+		advertiseHost:        *advertiseHost,
 	}
 }
 
@@ -184,20 +212,24 @@ func newPeerApp(cfg config) (*peerApp, error) {
 		listener: listener,
 		offsetCh: offsetCh,
 		grpcServer: &peerControlServer{
-			id:                 cfg.id,
-			isLeader:           cfg.leader,
-			pl:                 pl,
-			grpcPort:           cfg.grpcPort,
-			wavPath:            cfg.wavPath,
-			liveCapture:        cfg.liveCapture,
-			captureDevice:      cfg.captureDevice,
-			streamJitter:       cfg.streamJitter,
-			chunkLogStdoutMode: normalizeChunkLogMode(cfg.chunkLogStdoutMode),
-			chunkLogFileMode:   fileMode,
-			chunkLogEvery:      cfg.chunkLogEvery,
-			chunkLogFilePath:   chunkLogFilePath,
-			chunkLogFile:       chunkLogFile,
-			offsetCh:           offsetCh,
+			id:                   cfg.id,
+			isLeader:             cfg.leader,
+			pl:                   pl,
+			grpcPort:             cfg.grpcPort,
+			wavPath:              cfg.wavPath,
+			liveCapture:          cfg.liveCapture,
+			captureDevice:        cfg.captureDevice,
+			streamJitter:         cfg.streamJitter,
+			streamJitterAdaptive: cfg.streamJitterAdaptive,
+			streamJitterMin:      cfg.streamJitterMin,
+			streamJitterMax:      cfg.streamJitterMax,
+			streamJitterStep:     cfg.streamJitterStep,
+			chunkLogStdoutMode:   normalizeChunkLogMode(cfg.chunkLogStdoutMode),
+			chunkLogFileMode:     fileMode,
+			chunkLogEvery:        cfg.chunkLogEvery,
+			chunkLogFilePath:     chunkLogFilePath,
+			chunkLogFile:         chunkLogFile,
+			offsetCh:             offsetCh,
 		},
 	}, nil
 }
@@ -271,7 +303,7 @@ func (a *peerApp) Run() error {
 	}()
 
 	if a.cfg.leader {
-		fmt.Println("leader mode enabled")
+		log.Println("leader mode enabled")
 	}
 	if a.cfg.room {
 		roomURL := a.cfg.roomURL
@@ -333,7 +365,7 @@ func (a *peerApp) Run() error {
 		}()
 	}
 
-	fmt.Printf("peer %s listening on udp:%d (control:%d)\n", a.cfg.id, a.cfg.port, effectiveControlPort(a.cfg))
+	log.Printf("peer %s listening on udp:%d (control:%d)\n", a.cfg.id, a.cfg.port, effectiveControlPort(a.cfg))
 
 	go func() {
 		if a.cfg.leader {
@@ -376,6 +408,6 @@ func (a *peerApp) Run() error {
 	<-sigCh
 
 	a.ann.Stop()
-	fmt.Println("shutting down")
+	log.Println("shutting down")
 	return nil
 }

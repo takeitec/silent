@@ -29,25 +29,29 @@ import (
 type peerControlServer struct {
 	control.UnimplementedPeerControlServer
 
-	id             string
-	isLeader       bool
-	pl             *peerlist.PeerList
-	grpcPort       int
-	wavPath        string
-	liveCapture    bool
-	captureDevice  string
-	streamJitter   time.Duration
-	chunkLogStdoutMode string
-	chunkLogFileMode   string
-	chunkLogEvery      int
-	chunkLogFilePath   string
-	chunkLogFile       *os.File
-	chunkLogMu         stdsync.Mutex
-	offsetCh       chan time.Duration
-	sessionMu      stdsync.Mutex
-	activeSessions map[string]time.Time
-	sessionCancels map[string]context.CancelFunc
-	leaderStreams  map[string]*control.StreamPlaybackRequest
+	id                   string
+	isLeader             bool
+	pl                   *peerlist.PeerList
+	grpcPort             int
+	wavPath              string
+	liveCapture          bool
+	captureDevice        string
+	streamJitter         time.Duration
+	streamJitterAdaptive bool
+	streamJitterMin      time.Duration
+	streamJitterMax      time.Duration
+	streamJitterStep     time.Duration
+	chunkLogStdoutMode   string
+	chunkLogFileMode     string
+	chunkLogEvery        int
+	chunkLogFilePath     string
+	chunkLogFile         *os.File
+	chunkLogMu           stdsync.Mutex
+	offsetCh             chan time.Duration
+	sessionMu            stdsync.Mutex
+	activeSessions       map[string]time.Time
+	sessionCancels       map[string]context.CancelFunc
+	leaderStreams        map[string]*control.StreamPlaybackRequest
 }
 
 const (
@@ -812,6 +816,25 @@ func (s *peerControlServer) receiveAudioFromLeader(ctx context.Context, target s
 	if playoutDelay <= 0 {
 		playoutDelay = 200 * time.Millisecond
 	}
+	adaptiveEnabled := s.streamJitterAdaptive
+	adaptiveMin := s.streamJitterMin
+	adaptiveMax := s.streamJitterMax
+	adaptiveStep := s.streamJitterStep
+	if adaptiveMin <= 0 {
+		adaptiveMin = 80 * time.Millisecond
+	}
+	if adaptiveMax < adaptiveMin {
+		adaptiveMax = adaptiveMin
+	}
+	if adaptiveStep <= 0 {
+		adaptiveStep = 20 * time.Millisecond
+	}
+	if playoutDelay < adaptiveMin {
+		playoutDelay = adaptiveMin
+	}
+	if playoutDelay > adaptiveMax {
+		playoutDelay = adaptiveMax
+	}
 	chunkDur := streamChunkDuration(streamFormat)
 	silenceChunk := make([]byte, streamFormat.ChunkBytes)
 
@@ -972,10 +995,18 @@ func (s *peerControlServer) receiveAudioFromLeader(ctx context.Context, target s
 	lastChunkAt := time.Time{}
 	lastStallLogAt := time.Time{}
 	lastHealthLogAt := time.Now()
+	lastAdaptiveTuneAt := time.Now()
+	lastAdaptiveReceived := int64(0)
+	lastAdaptiveLate := int64(0)
+	lastAdaptiveUnderflows := int64(0)
+	lastAdaptiveCatchup := int64(0)
+	stableAdaptiveWindows := 0
 
 	const maxPlayoutStepsPerDrain = 8
 	const receiveStallLogInterval = 2 * time.Second
 	const healthLogInterval = 5 * time.Second
+	const adaptiveTuneInterval = 5 * time.Second
+	const adaptiveDecreaseStableWindows = 2
 
 	logHealth := func(stage string) {
 		log.Printf("gRPC stream: health stage=%s session=%q target=%s received=%d played=%d late_dropped=%d duplicate_dropped=%d underflows=%d gap_silence=%d catchup_resyncs=%d buffered=%d expected_seq=%d one_way=%s",
@@ -1058,6 +1089,60 @@ func (s *peerControlServer) receiveAudioFromLeader(ctx context.Context, target s
 		select {
 		case <-ticker.C:
 			now := time.Now()
+			if adaptiveEnabled && playoutStarted && now.Sub(lastAdaptiveTuneAt) >= adaptiveTuneInterval {
+				windowReceived := metrics.ReceivedChunks - lastAdaptiveReceived
+				windowLate := metrics.LateDropped - lastAdaptiveLate
+				windowUnderflows := metrics.Underflows - lastAdaptiveUnderflows
+				windowCatchup := metrics.CatchupResyncs - lastAdaptiveCatchup
+
+				newDelay := playoutDelay
+				reason := ""
+				if windowUnderflows > 0 || windowLate > 0 || windowCatchup > 0 {
+					stableAdaptiveWindows = 0
+					candidate := playoutDelay + adaptiveStep
+					if candidate > adaptiveMax {
+						candidate = adaptiveMax
+					}
+					if candidate != playoutDelay {
+						newDelay = candidate
+						reason = fmt.Sprintf("increase underflows=%d late=%d catchup=%d", windowUnderflows, windowLate, windowCatchup)
+					}
+				} else if windowReceived > 0 {
+					stableAdaptiveWindows++
+					if stableAdaptiveWindows >= adaptiveDecreaseStableWindows {
+						candidate := playoutDelay - adaptiveStep
+						if candidate < adaptiveMin {
+							candidate = adaptiveMin
+						}
+						if candidate != playoutDelay {
+							newDelay = candidate
+							reason = fmt.Sprintf("decrease stable_windows=%d window_received=%d buffered=%d", stableAdaptiveWindows, windowReceived, len(pending))
+						}
+						stableAdaptiveWindows = 0
+					}
+				} else {
+					stableAdaptiveWindows = 0
+				}
+
+				if newDelay != playoutDelay {
+					delta := newDelay - playoutDelay
+					playoutDelay = newDelay
+					metrics.TargetJitterDelay = playoutDelay
+					nextPlayoutAt = nextPlayoutAt.Add(delta)
+					floor := now.Add(chunkDur / 2)
+					if nextPlayoutAt.Before(floor) {
+						nextPlayoutAt = floor
+					}
+					log.Printf("gRPC stream: adaptive jitter adjusted session=%q target=%s new_delay=%s min=%s max=%s step=%s reason=%s", req.SessionId, target, playoutDelay, adaptiveMin, adaptiveMax, adaptiveStep, reason)
+				}
+
+				lastAdaptiveTuneAt = now
+				lastAdaptiveReceived = metrics.ReceivedChunks
+				lastAdaptiveLate = metrics.LateDropped
+				lastAdaptiveUnderflows = metrics.Underflows
+				lastAdaptiveCatchup = metrics.CatchupResyncs
+			}
+
 			if now.Sub(lastHealthLogAt) >= healthLogInterval {
 				lastHealthLogAt = now
 				logHealth("periodic")

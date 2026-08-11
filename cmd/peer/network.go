@@ -44,7 +44,7 @@ func handleControl(listener *net.UDPConn, leader bool) error {
 			serverSend := time.Now()
 			response := fmt.Sprintf("SYNC-ACK|%d|%d", recv.UnixNano(), serverSend.UnixNano())
 			_, _ = listener.WriteToUDP([]byte(response), addr)
-			fmt.Printf("leader received sync ping from %s\n", addr.String())
+			log.Printf("leader received sync ping from %s\n", addr.String())
 		}
 	}
 }
@@ -96,7 +96,7 @@ func probeLeader(peer models.Peer, id string, controlPort int, offsetCh chan tim
 	default:
 	}
 
-	fmt.Printf("%s synced with leader, offset=%s\n", id, offset)
+	log.Printf("%s synced with leader, offset=%s\n", id, offset)
 	return nil
 }
 
