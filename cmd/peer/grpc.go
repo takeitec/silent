@@ -738,12 +738,33 @@ func (s *peerControlServer) StreamAudio(req *control.StreamPlaybackRequest, stre
 	log.Printf("gRPC stream: using source=%s for session=%q", sourceName, req.SessionId)
 
 	buf := make([]byte, streamFormat.ChunkBytes)
+	chunkDur := streamChunkDuration(streamFormat)
+	paceStream := sourceName != "live-capture" && chunkDur > 0
+	nextSendAt := time.Time{}
 	seq := int64(0)
 	chunksSent := 0
 
 	for {
 		n, err := io.ReadFull(source, buf)
 		if n > 0 {
+			if paceStream {
+				now := time.Now()
+				if nextSendAt.IsZero() {
+					nextSendAt = now
+				}
+				if wait := time.Until(nextSendAt); wait > 0 {
+					timer := time.NewTimer(wait)
+					select {
+					case <-stream.Context().Done():
+						if !timer.Stop() {
+							<-timer.C
+						}
+						return stream.Context().Err()
+					case <-timer.C:
+					}
+				}
+			}
+
 			chunk := &control.AudioChunk{
 				SessionId:   req.SessionId,
 				AudioId:     req.AudioId,
@@ -758,6 +779,9 @@ func (s *peerControlServer) StreamAudio(req *control.StreamPlaybackRequest, stre
 			}
 			chunksSent++
 			s.logChunkEvent("sent", req.SessionId, target, seq, len(chunk.Data), streamFormat.ChunkBytes, "")
+			if paceStream {
+				nextSendAt = nextSendAt.Add(chunkDur)
+			}
 			seq++
 		}
 
@@ -988,6 +1012,7 @@ func (s *peerControlServer) receiveAudioFromLeader(ctx context.Context, target s
 	playoutStarted := false
 	requestedStart := !sharedAt.IsZero() && req.GetSharedAtNanos() > 0
 	startAt := time.Time{}
+	playoutStartedAt := time.Time{}
 	nextPlayoutAt := time.Time{}
 	expectedSeq := int64(0)
 	endSeq := int64(-1)
@@ -1001,15 +1026,103 @@ func (s *peerControlServer) receiveAudioFromLeader(ctx context.Context, target s
 	lastAdaptiveUnderflows := int64(0)
 	lastAdaptiveCatchup := int64(0)
 	stableAdaptiveWindows := 0
+	lastDelayError := time.Duration(0)
+	hardResyncWindowUntil := time.Time{}
+	lastHardResyncAt := time.Time{}
+	latestSeqReceived := int64(-1)
+	missingSeqHoldCount := 0
 
 	const maxPlayoutStepsPerDrain = 8
 	const receiveStallLogInterval = 2 * time.Second
 	const healthLogInterval = 5 * time.Second
 	const adaptiveTuneInterval = 5 * time.Second
 	const adaptiveDecreaseStableWindows = 2
+	const softResyncBand = 120 * time.Millisecond
+	const softResyncMinStep = 10 * time.Millisecond
+	const softResyncMaxStep = 18 * time.Millisecond
+	const softResyncGain = 0.10
+	const softResyncCooldown = 800 * time.Millisecond
+	const hardResyncDelayThreshold = 1200 * time.Millisecond
+	const hardResyncChunkThreshold = 90
+	const hardResyncCooldown = 10 * time.Second
+	const hardResyncWindow = 6 * time.Second
+	const hardResyncRetainChunks = 3
+	const ingressHardResyncScale = 4
+	const missingSeqHoldChunks = 6
+	const resyncWarmup = 3 * time.Second
+	const minSoftResyncBufferedChunks = 4
+
+	lastSoftResyncAt := time.Time{}
+
+	currentQueueDelay := func() time.Duration {
+		if chunkDur <= 0 {
+			return 0
+		}
+		return time.Duration(len(pending)) * chunkDur
+	}
+
+	absoluteDuration := func(v time.Duration) time.Duration {
+		if v < 0 {
+			return -v
+		}
+		return v
+	}
+
+	hardResyncAllowed := func(now time.Time) bool {
+		if lastHardResyncAt.IsZero() {
+			return true
+		}
+		return now.Sub(lastHardResyncAt) >= hardResyncCooldown
+	}
+
+	hardResync := func(now time.Time, reason string) {
+		if !initialized || !playoutStarted {
+			return
+		}
+
+		oldExpected := expectedSeq
+		oldPending := len(pending)
+		oldQueueDelay := currentQueueDelay()
+
+		anchorSeq := expectedSeq
+		if oldPending > hardResyncRetainChunks {
+			anchorSeq = latestSeqReceived
+			if anchorSeq < expectedSeq {
+				anchorSeq = expectedSeq
+			}
+			anchorSeq = anchorSeq - int64(hardResyncRetainChunks-1)
+			if anchorSeq < expectedSeq {
+				anchorSeq = expectedSeq
+			}
+		}
+
+		dropped := 0
+		for seq := range pending {
+			if seq < anchorSeq {
+				delete(pending, seq)
+				dropped++
+			}
+		}
+
+		expectedSeq = anchorSeq
+		missingSeqHoldCount = 0
+		nextPlayoutAt = now.Add(chunkDur)
+		metrics.CatchupResyncs++
+		metrics.HardResyncs++
+		lastSoftResyncAt = now
+		lastHardResyncAt = now
+		hardResyncWindowUntil = now.Add(hardResyncWindow)
+
+		newQueueDelay := currentQueueDelay()
+		lastDelayError = newQueueDelay - playoutDelay
+
+		log.Printf("gRPC stream: hard resync session=%q target=%s reason=%s dropped=%d expected_seq=%d->%d pending=%d->%d queue_delay=%s->%s delay_error=%s", req.SessionId, target, reason, dropped, oldExpected, expectedSeq, oldPending, len(pending), oldQueueDelay, newQueueDelay, lastDelayError)
+	}
 
 	logHealth := func(stage string) {
-		log.Printf("gRPC stream: health stage=%s session=%q target=%s received=%d played=%d late_dropped=%d duplicate_dropped=%d underflows=%d gap_silence=%d catchup_resyncs=%d buffered=%d expected_seq=%d one_way=%s",
+		queueDelay := currentQueueDelay()
+		delayError := queueDelay - playoutDelay
+		log.Printf("gRPC stream: health stage=%s session=%q target=%s received=%d played=%d late_dropped=%d duplicate_dropped=%d underflows=%d gap_silence=%d catchup_resyncs=%d hard_resyncs=%d buffered=%d expected_seq=%d queue_delay=%s delay_error=%s one_way=%s",
 			stage,
 			req.SessionId,
 			target,
@@ -1020,8 +1133,11 @@ func (s *peerControlServer) receiveAudioFromLeader(ctx context.Context, target s
 			metrics.Underflows,
 			metrics.GapFillSilence,
 			metrics.CatchupResyncs,
+			metrics.HardResyncs,
 			len(pending),
 			expectedSeq,
+			queueDelay,
+			delayError,
 			metrics.OneWaySummary(),
 		)
 	}
@@ -1042,6 +1158,7 @@ func (s *peerControlServer) receiveAudioFromLeader(ctx context.Context, target s
 				return nil
 			}
 			playoutStarted = true
+			playoutStartedAt = now
 			nextPlayoutAt = startAt
 			log.Printf("gRPC stream: playout started session=%q target=%s start_at=%s jitter_delay=%s requested_start=%v", req.SessionId, target, startAt.Format(time.RFC3339Nano), playoutDelay, requestedStart)
 		}
@@ -1058,6 +1175,7 @@ func (s *peerControlServer) receiveAudioFromLeader(ctx context.Context, target s
 
 			if data, ok := pending[expectedSeq]; ok {
 				delete(pending, expectedSeq)
+				missingSeqHoldCount = 0
 				metrics.PlayedChunks++
 				if err := writeAudio(data, expectedSeq, "chunk"); err != nil {
 					return err
@@ -1068,6 +1186,19 @@ func (s *peerControlServer) receiveAudioFromLeader(ctx context.Context, target s
 				if err := writeAudio(silenceChunk, expectedSeq, "silence-gap"); err != nil {
 					return err
 				}
+				if eosSeen || missingSeqHoldCount >= missingSeqHoldChunks {
+					expectedSeq++
+					missingSeqHoldCount = 0
+				} else {
+					missingSeqHoldCount++
+				}
+
+				nextPlayoutAt = nextPlayoutAt.Add(chunkDur)
+
+				if eosSeen && expectedSeq > endSeq && len(pending) == 0 {
+					return nil
+				}
+				continue
 			}
 
 			expectedSeq++
@@ -1089,6 +1220,39 @@ func (s *peerControlServer) receiveAudioFromLeader(ctx context.Context, target s
 		select {
 		case <-ticker.C:
 			now := time.Now()
+			if playoutStarted && initialized {
+				queueDelay := currentQueueDelay()
+				delayError := queueDelay - playoutDelay
+				lastDelayError = delayError
+				chunkBacklog := len(pending)
+				inWarmup := !playoutStartedAt.IsZero() && now.Sub(playoutStartedAt) < resyncWarmup
+
+				hardByDelay := delayError > hardResyncDelayThreshold
+				hardByChunks := chunkBacklog >= hardResyncChunkThreshold
+
+				if !inWarmup && (hardByDelay && hardByChunks) && hardResyncAllowed(now) {
+					hardResync(now, fmt.Sprintf("delay_error=%s threshold=%s backlog_chunks=%d chunk_threshold=%d", delayError, hardResyncDelayThreshold, chunkBacklog, hardResyncChunkThreshold))
+				} else if !inWarmup && now.After(hardResyncWindowUntil) && absoluteDuration(delayError) > softResyncBand {
+					starving := delayError < 0 && chunkBacklog < minSoftResyncBufferedChunks
+					if !starving && (lastSoftResyncAt.IsZero() || now.Sub(lastSoftResyncAt) >= softResyncCooldown) {
+						magnitude := time.Duration(float64(absoluteDuration(delayError)) * softResyncGain)
+						if magnitude < softResyncMinStep {
+							magnitude = softResyncMinStep
+						}
+						if magnitude > softResyncMaxStep {
+							magnitude = softResyncMaxStep
+						}
+						step := -magnitude
+						if delayError < 0 {
+							step = magnitude
+						}
+						nextPlayoutAt = nextPlayoutAt.Add(step)
+						lastSoftResyncAt = now
+						log.Printf("gRPC stream: soft resync nudge session=%q target=%s step=%s queue_delay=%s target_delay=%s delay_error=%s", req.SessionId, target, step, queueDelay, playoutDelay, delayError)
+					}
+				}
+			}
+
 			if adaptiveEnabled && playoutStarted && now.Sub(lastAdaptiveTuneAt) >= adaptiveTuneInterval {
 				windowReceived := metrics.ReceivedChunks - lastAdaptiveReceived
 				windowLate := metrics.LateDropped - lastAdaptiveLate
@@ -1107,7 +1271,7 @@ func (s *peerControlServer) receiveAudioFromLeader(ctx context.Context, target s
 						newDelay = candidate
 						reason = fmt.Sprintf("increase underflows=%d late=%d catchup=%d", windowUnderflows, windowLate, windowCatchup)
 					}
-				} else if windowReceived > 0 {
+				} else if windowReceived > 0 && currentQueueDelay() <= playoutDelay {
 					stableAdaptiveWindows++
 					if stableAdaptiveWindows >= adaptiveDecreaseStableWindows {
 						candidate := playoutDelay - adaptiveStep
@@ -1129,10 +1293,6 @@ func (s *peerControlServer) receiveAudioFromLeader(ctx context.Context, target s
 					playoutDelay = newDelay
 					metrics.TargetJitterDelay = playoutDelay
 					nextPlayoutAt = nextPlayoutAt.Add(delta)
-					floor := now.Add(chunkDur / 2)
-					if nextPlayoutAt.Before(floor) {
-						nextPlayoutAt = floor
-					}
 					log.Printf("gRPC stream: adaptive jitter adjusted session=%q target=%s new_delay=%s min=%s max=%s step=%s reason=%s", req.SessionId, target, playoutDelay, adaptiveMin, adaptiveMax, adaptiveStep, reason)
 				}
 
@@ -1240,6 +1400,9 @@ func (s *peerControlServer) receiveAudioFromLeader(ctx context.Context, target s
 			}
 
 			seq := chunk.GetSequence()
+			if seq > latestSeqReceived {
+				latestSeqReceived = seq
+			}
 			if seq < expectedSeq {
 				metrics.LateDropped++
 				continue
@@ -1252,13 +1415,23 @@ func (s *peerControlServer) receiveAudioFromLeader(ctx context.Context, target s
 			if depth := len(pending); depth > metrics.MaxBufferedChunks {
 				metrics.MaxBufferedChunks = depth
 			}
+			if playoutStarted {
+				queueDelay := currentQueueDelay()
+				delayError := queueDelay - playoutDelay
+				lastDelayError = delayError
+				chunkBacklog := len(pending)
+				inWarmup := !playoutStartedAt.IsZero() && time.Since(playoutStartedAt) < resyncWarmup
+				if !inWarmup && (delayError >= hardResyncDelayThreshold*time.Duration(ingressHardResyncScale) && chunkBacklog >= hardResyncChunkThreshold*ingressHardResyncScale) && hardResyncAllowed(time.Now()) {
+					hardResync(time.Now(), fmt.Sprintf("ingress backlog delay_error=%s backlog_chunks=%d", delayError, chunkBacklog))
+				}
+			}
 
 			if err := drainReady(env.at); err != nil {
 				logHealth("drain-error")
 				return err
 			}
 
-			extra := fmt.Sprintf("buffered=%d", len(pending))
+			extra := fmt.Sprintf("buffered=%d queue_delay=%s delay_error=%s", len(pending), currentQueueDelay(), lastDelayError)
 			s.logChunkEvent("buffered", req.SessionId, target, seq, len(chunk.GetData()), streamFormat.ChunkBytes, extra)
 		}
 	}

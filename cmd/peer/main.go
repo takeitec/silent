@@ -3,6 +3,7 @@ package main
 import (
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"os"
@@ -10,6 +11,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -38,13 +40,132 @@ type config struct {
 	chunkLogFileMode     string
 	chunkLogDir          string
 	chunkLogEvery        int
+	logOutput            string
+	logDir               string
+	logFileName          string
+	logTimeFormat        string
 	room                 bool
 	roomURL              string
 	advertiseHost        string
 }
 
+const (
+	logOutputStdout = "stdout"
+	logOutputFile   = "file"
+	logOutputBoth   = "both"
+
+	logTimeRFC3339Nano = "rfc3339nano"
+	logTimeRFC3339     = "rfc3339"
+)
+
+type timestampedLogWriter struct {
+	mu         sync.Mutex
+	w          io.Writer
+	timeFormat string
+}
+
+func (tw *timestampedLogWriter) Write(p []byte) (int, error) {
+	tw.mu.Lock()
+	defer tw.mu.Unlock()
+
+	text := strings.TrimRight(string(p), "\n")
+	if text == "" {
+		return len(p), nil
+	}
+
+	lines := strings.Split(text, "\n")
+	for _, line := range lines {
+		ts := time.Now().Format(tw.timeFormat)
+		if _, err := fmt.Fprintf(tw.w, "%s %s\n", ts, line); err != nil {
+			return 0, err
+		}
+	}
+
+	return len(p), nil
+}
+
+func normalizeLogOutput(mode string) string {
+	switch strings.ToLower(strings.TrimSpace(mode)) {
+	case logOutputStdout, logOutputFile, logOutputBoth:
+		return strings.ToLower(strings.TrimSpace(mode))
+	default:
+		return logOutputBoth
+	}
+}
+
+func normalizeLogTimeFormat(value string) string {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case logTimeRFC3339:
+		return time.RFC3339
+	case logTimeRFC3339Nano:
+		return time.RFC3339Nano
+	default:
+		return time.RFC3339Nano
+	}
+}
+
+func configureAppLogging(cfg config) (*os.File, error) {
+	outputMode := normalizeLogOutput(cfg.logOutput)
+	timeFormat := normalizeLogTimeFormat(cfg.logTimeFormat)
+
+	var outputs []io.Writer
+	if outputMode == logOutputStdout || outputMode == logOutputBoth {
+		outputs = append(outputs, os.Stdout)
+	}
+
+	var logFile *os.File
+	if outputMode == logOutputFile || outputMode == logOutputBoth {
+		logDir := strings.TrimSpace(cfg.logDir)
+		if logDir == "" {
+			logDir = "logs"
+		}
+		if err := os.MkdirAll(logDir, 0o755); err != nil {
+			return nil, fmt.Errorf("create log directory %q: %w", logDir, err)
+		}
+
+		fileName := strings.TrimSpace(cfg.logFileName)
+		if fileName == "" {
+			fileName = fmt.Sprintf("silent-peer-%s.log", sanitizeForFilename(cfg.id))
+		}
+
+		logPath := filepath.Join(logDir, fileName)
+		f, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+		if err != nil {
+			return nil, fmt.Errorf("open log file %q: %w", logPath, err)
+		}
+		logFile = f
+		outputs = append(outputs, f)
+	}
+
+	if len(outputs) == 0 {
+		outputs = append(outputs, os.Stdout)
+	}
+
+	log.SetFlags(0)
+	log.SetOutput(&timestampedLogWriter{
+		w:          io.MultiWriter(outputs...),
+		timeFormat: timeFormat,
+	})
+
+	if logFile != nil {
+		log.Printf("app log: output=%s file=%s", outputMode, logFile.Name())
+	} else {
+		log.Printf("app log: output=%s", outputMode)
+	}
+
+	return logFile, nil
+}
+
 func main() {
 	cfg := parseFlags()
+
+	appLogFile, err := configureAppLogging(cfg)
+	if err != nil {
+		log.Fatalf("configure logging: %v", err)
+	}
+	if appLogFile != nil {
+		defer appLogFile.Close()
+	}
 
 	app, err := newPeerApp(cfg)
 	if err != nil {
@@ -76,6 +197,10 @@ func parseFlags() config {
 	chunkLogFileMode := flag.String("stream-chunk-log-file", "all", "chunk log verbosity to file: off|milestone|all")
 	chunkLogDir := flag.String("stream-chunk-log-dir", "logs", "directory for stream chunk log files")
 	chunkLogEvery := flag.Int("stream-chunk-log-every", 100, "milestone interval for stream chunk logs")
+	logOutput := flag.String("log-output", "both", "application log output mode: stdout|file|both")
+	logDir := flag.String("log-dir", "logs", "directory for application log files")
+	logFileName := flag.String("log-file", "", "application log filename (default: silent-peer-<id>.log)")
+	logTimeFormat := flag.String("log-time-format", "rfc3339nano", "application log timestamp format: rfc3339nano|rfc3339")
 	room := flag.Bool("room", true, "use room-based discovery instead of UDP broadcast")
 	roomURL := flag.String("room-url", "http://127.0.0.1:9100", "room service base URL")
 	advertiseHost := flag.String("advertise-host", "", "override the host advertised to other peers")
@@ -130,6 +255,10 @@ func parseFlags() config {
 		chunkLogFileMode:     *chunkLogFileMode,
 		chunkLogDir:          *chunkLogDir,
 		chunkLogEvery:        every,
+		logOutput:            *logOutput,
+		logDir:               *logDir,
+		logFileName:          *logFileName,
+		logTimeFormat:        *logTimeFormat,
 		room:                 *room,
 		roomURL:              *roomURL,
 		advertiseHost:        *advertiseHost,

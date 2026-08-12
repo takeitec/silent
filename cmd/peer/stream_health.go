@@ -15,6 +15,7 @@ type streamHealthMetrics struct {
 	Underflows        int64
 	GapFillSilence    int64
 	CatchupResyncs    int64
+	HardResyncs       int64
 	MaxBufferedChunks int
 	oneWaySamples     int64
 	oneWayTotal       time.Duration
