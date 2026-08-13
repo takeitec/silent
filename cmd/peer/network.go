@@ -19,6 +19,99 @@ type latestOffset struct {
 	set   bool
 }
 
+type syncPingLogEntry struct {
+	lastLogAt time.Time
+	count     int
+}
+
+type followerSyncLogEntry struct {
+	lastLogAt        time.Time
+	lastLoggedOffset time.Duration
+	count            int
+	initialized      bool
+}
+
+var (
+	syncPingLogMu     stdsync.Mutex
+	syncPingLogByHost = make(map[string]*syncPingLogEntry)
+	syncPingLogWindow = 30 * time.Second
+
+	followerSyncLogMu        stdsync.Mutex
+	followerSyncLogByID      = make(map[string]*followerSyncLogEntry)
+	followerSyncLogWindow    = 30 * time.Second
+	followerSyncChangeThresh = 2 * time.Millisecond
+)
+
+func absDuration(v time.Duration) time.Duration {
+	if v < 0 {
+		return -v
+	}
+	return v
+}
+
+func logLeaderSyncPing(addr *net.UDPAddr) {
+	if addr == nil {
+		return
+	}
+	host := addr.IP.String()
+	if strings.TrimSpace(host) == "" {
+		host = addr.String()
+	}
+
+	now := time.Now()
+	syncPingLogMu.Lock()
+	entry := syncPingLogByHost[host]
+	if entry == nil {
+		entry = &syncPingLogEntry{}
+		syncPingLogByHost[host] = entry
+	}
+	entry.count++
+	if !entry.lastLogAt.IsZero() && now.Sub(entry.lastLogAt) < syncPingLogWindow {
+		syncPingLogMu.Unlock()
+		return
+	}
+	count := entry.count
+	entry.count = 0
+	entry.lastLogAt = now
+	syncPingLogMu.Unlock()
+
+	logDebugf("leader received sync pings from host=%s count=%d window=%s", host, count, syncPingLogWindow)
+}
+
+func logFollowerSync(id string, offset time.Duration) {
+	now := time.Now()
+	followerSyncLogMu.Lock()
+	entry := followerSyncLogByID[id]
+	if entry == nil {
+		entry = &followerSyncLogEntry{}
+		followerSyncLogByID[id] = entry
+	}
+	entry.count++
+
+	shouldLog := !entry.initialized || now.Sub(entry.lastLogAt) >= followerSyncLogWindow || absDuration(offset-entry.lastLoggedOffset) >= followerSyncChangeThresh
+	if !shouldLog {
+		followerSyncLogMu.Unlock()
+		return
+	}
+
+	count := entry.count
+	previousOffset := entry.lastLoggedOffset
+	initialized := entry.initialized
+	entry.lastLogAt = now
+	entry.lastLoggedOffset = offset
+	entry.count = 0
+	entry.initialized = true
+	followerSyncLogMu.Unlock()
+
+	delta := offset - previousOffset
+	if !initialized {
+		logInfof("%s synced with leader, offset=%s", id, offset)
+		return
+	}
+
+	logDebugf("%s sync summary offset=%s delta=%s probes=%d window=%s", id, offset, delta, count, followerSyncLogWindow)
+}
+
 func (o *latestOffset) Set(value time.Duration) {
 	if o == nil {
 		return
@@ -69,7 +162,7 @@ func handleControl(listener *net.UDPConn, leader bool) error {
 			serverSend := time.Now()
 			response := fmt.Sprintf("SYNC-ACK|%d|%d", recv.UnixNano(), serverSend.UnixNano())
 			_, _ = listener.WriteToUDP([]byte(response), addr)
-			logDebugf("leader received sync ping from %s", addr.String())
+			logLeaderSyncPing(addr)
 		}
 	}
 }
@@ -118,7 +211,7 @@ func probeLeader(peer models.Peer, id string, controlPort int, offsetState *late
 
 	offsetState.Set(offset)
 
-	logInfof("%s synced with leader, offset=%s", id, offset)
+	logFollowerSync(id, offset)
 	return nil
 }
 
