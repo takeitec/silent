@@ -46,7 +46,7 @@ type peerControlServer struct {
 	chunkLogFilePath     string
 	chunkLogFile         *os.File
 	chunkLogMu           stdsync.Mutex
-	offsetCh             chan time.Duration
+	offsetState          *latestOffset
 	sessionMu            stdsync.Mutex
 	activeSessions       map[string]time.Time
 	sessionCancels       map[string]context.CancelFunc
@@ -59,7 +59,7 @@ const (
 	chunkLogModeAll       = "all"
 )
 
-func normalizeChunkLogMode(mode string) string {
+func normaliseChunkLogMode(mode string) string {
 	switch strings.ToLower(strings.TrimSpace(mode)) {
 	case chunkLogModeOff, chunkLogModeMilestone, chunkLogModeAll:
 		return strings.ToLower(strings.TrimSpace(mode))
@@ -69,7 +69,7 @@ func normalizeChunkLogMode(mode string) string {
 }
 
 func (s *peerControlServer) shouldLogChunk(mode string, seq int64, size, expectedSize int) bool {
-	mode = normalizeChunkLogMode(mode)
+	mode = normaliseChunkLogMode(mode)
 	if mode == chunkLogModeOff {
 		return false
 	}
@@ -169,13 +169,7 @@ func (s *peerControlServer) StartPlayback(ctx context.Context, req *control.Play
 
 func (s *peerControlServer) NotifyPlayback(ctx context.Context, req *control.PlaybackCommand) (*control.PlaybackAck, error) {
 	sharedAt := time.Unix(0, req.SharedAtNanos)
-	var offset time.Duration
-
-	select {
-	case currentOffset := <-s.offsetCh:
-		offset = currentOffset
-	default:
-	}
+	offset := s.currentOffset()
 
 	localAt := syncutil.ConvertSharedTimeToLocal(sharedAt, offset)
 
@@ -184,6 +178,17 @@ func (s *peerControlServer) NotifyPlayback(ctx context.Context, req *control.Pla
 	go schedulePlayback(localAt, req.AudioPath)
 
 	return &control.PlaybackAck{Accepted: true}, nil
+}
+
+func (s *peerControlServer) currentOffset() time.Duration {
+	if s == nil || s.offsetState == nil {
+		return 0
+	}
+	offset, ok := s.offsetState.Get()
+	if !ok {
+		return 0
+	}
+	return offset
 }
 
 func hostFromAddress(addr string) string {
@@ -260,9 +265,9 @@ func triggerPlaybackOnLeader(addr string) error {
 }
 
 func (s *peerControlServer) StartStreamPlayback(ctx context.Context, req *control.StreamPlaybackRequest) (*control.StreamPlaybackResponse, error) {
-	streamReq := normalizeStreamRequest(req)
-	streamFormat := normalizeStreamPlaybackRequest(streamReq)
-	sessionID := normalizeSessionID(streamReq.SessionId)
+	streamReq := normaliseStreamRequest(req)
+	streamFormat := normaliseStreamPlaybackRequest(streamReq)
+	sessionID := normaliseSessionID(streamReq.SessionId)
 	logInfof("gRPC stream: StartStreamPlayback session=%q audio_id=%q audio_path=%q shared_at=%s", sessionID, streamReq.AudioId, streamReq.AudioPath, time.Unix(0, streamReq.SharedAtNanos).Format(time.RFC3339Nano))
 
 	// If this peer is already handling the same session, reject the duplicate request.
@@ -355,7 +360,7 @@ func (s *peerControlServer) StartStreamPlayback(ctx context.Context, req *contro
 }
 
 func (s *peerControlServer) JoinStreamPlayback(ctx context.Context, req *control.JoinStreamRequest) (*control.JoinStreamResponse, error) {
-	sessionID := normalizeSessionID(req.GetSessionId())
+	sessionID := normaliseSessionID(req.GetSessionId())
 	followerID := strings.TrimSpace(req.GetFollowerId())
 	logInfof("gRPC stream: JoinStreamPlayback session=%q follower=%q leader=%v", sessionID, followerID, s.isLeader)
 
@@ -428,7 +433,7 @@ func (s *peerControlServer) JoinStreamPlayback(ctx context.Context, req *control
 }
 
 func (s *peerControlServer) StopStreamPlayback(ctx context.Context, req *control.StopStreamRequest) (*control.StopStreamResponse, error) {
-	sessionID := normalizeSessionID(req.GetSessionId())
+	sessionID := normaliseSessionID(req.GetSessionId())
 	reason := strings.TrimSpace(req.GetReason())
 	if reason == "" {
 		reason = "stop requested"
@@ -523,18 +528,18 @@ func (s *peerControlServer) beginSession(sessionID string) bool {
 	}
 
 	now := time.Now()
-	normalized := normalizeSessionID(sessionID)
-	if _, active := s.sessionCancels[normalized]; active {
+	normalised := normaliseSessionID(sessionID)
+	if _, active := s.sessionCancels[normalised]; active {
 		return false
 	}
 
-	if expiry, ok := s.activeSessions[sessionID]; ok {
+	if expiry, ok := s.activeSessions[normalised]; ok {
 		if now.Before(expiry) {
 			return false
 		}
 	}
 
-	s.activeSessions[sessionID] = now.Add(sessionLease)
+	s.activeSessions[normalised] = now.Add(sessionLease)
 	return true
 }
 
@@ -542,28 +547,28 @@ func (s *peerControlServer) finishSession(sessionID string) {
 	s.sessionMu.Lock()
 	defer s.sessionMu.Unlock()
 
-	sessionID = normalizeSessionID(sessionID)
+	sessionID = normaliseSessionID(sessionID)
 	delete(s.activeSessions, sessionID)
 }
 
-func normalizeSessionID(sessionID string) string {
+func normaliseSessionID(sessionID string) string {
 	if strings.TrimSpace(sessionID) == "" {
 		return "default"
 	}
 	return strings.TrimSpace(sessionID)
 }
 
-func normalizeStreamRequest(req *control.StreamPlaybackRequest) *control.StreamPlaybackRequest {
+func normaliseStreamRequest(req *control.StreamPlaybackRequest) *control.StreamPlaybackRequest {
 	if req == nil {
 		req = &control.StreamPlaybackRequest{}
 	}
-	normalized := cloneStreamPlaybackRequest(req)
-	normalized.SessionId = normalizeSessionID(normalized.SessionId)
-	format := normalizeStreamPlaybackRequest(normalized)
-	normalized.SampleRate = uint32(format.SampleRate)
-	normalized.Channels = uint32(format.Channels)
-	normalized.SampleFormat = format.SampleFormat
-	return normalized
+	normalised := cloneStreamPlaybackRequest(req)
+	normalised.SessionId = normaliseSessionID(normalised.SessionId)
+	format := normaliseStreamPlaybackRequest(normalised)
+	normalised.SampleRate = uint32(format.SampleRate)
+	normalised.Channels = uint32(format.Channels)
+	normalised.SampleFormat = format.SampleFormat
+	return normalised
 }
 
 func cloneStreamPlaybackRequest(req *control.StreamPlaybackRequest) *control.StreamPlaybackRequest {
@@ -589,17 +594,17 @@ func (s *peerControlServer) storeLeaderStream(req *control.StreamPlaybackRequest
 	if s.leaderStreams == nil {
 		s.leaderStreams = make(map[string]*control.StreamPlaybackRequest)
 	}
-	normalized := normalizeSessionID(req.GetSessionId())
-	s.leaderStreams[normalized] = cloneStreamPlaybackRequest(req)
-	logInfof("gRPC stream: stored leader stream template session=%q", normalized)
+	normalised := normaliseSessionID(req.GetSessionId())
+	s.leaderStreams[normalised] = cloneStreamPlaybackRequest(req)
+	logInfof("gRPC stream: stored leader stream template session=%q", normalised)
 }
 
 func (s *peerControlServer) loadLeaderStream(sessionID string) (*control.StreamPlaybackRequest, bool) {
 	s.sessionMu.Lock()
 	defer s.sessionMu.Unlock()
 
-	normalized := normalizeSessionID(sessionID)
-	req, ok := s.leaderStreams[normalized]
+	normalised := normaliseSessionID(sessionID)
+	req, ok := s.leaderStreams[normalised]
 	if !ok {
 		return nil, false
 	}
@@ -610,13 +615,13 @@ func (s *peerControlServer) clearLeaderStream(sessionID string) {
 	s.sessionMu.Lock()
 	defer s.sessionMu.Unlock()
 
-	normalized := normalizeSessionID(sessionID)
+	normalised := normaliseSessionID(sessionID)
 	if s.leaderStreams == nil {
 		return
 	}
-	if _, ok := s.leaderStreams[normalized]; ok {
-		delete(s.leaderStreams, normalized)
-		logInfof("gRPC stream: cleared leader stream template session=%q", normalized)
+	if _, ok := s.leaderStreams[normalised]; ok {
+		delete(s.leaderStreams, normalised)
+		logInfof("gRPC stream: cleared leader stream template session=%q", normalised)
 	}
 }
 
@@ -665,18 +670,18 @@ func (s *peerControlServer) setSessionCancel(sessionID string, cancel context.Ca
 	if s.sessionCancels == nil {
 		s.sessionCancels = make(map[string]context.CancelFunc)
 	}
-	normalized := normalizeSessionID(sessionID)
-	s.sessionCancels[normalized] = cancel
-	logInfof("gRPC stream: registered cancellable session=%q", normalized)
+	normalised := normaliseSessionID(sessionID)
+	s.sessionCancels[normalised] = cancel
+	logInfof("gRPC stream: registered cancellable session=%q", normalised)
 }
 
 func (s *peerControlServer) clearSessionCancel(sessionID string) {
 	s.sessionMu.Lock()
 	defer s.sessionMu.Unlock()
-	normalized := normalizeSessionID(sessionID)
-	if _, ok := s.sessionCancels[normalized]; ok {
-		delete(s.sessionCancels, normalized)
-		logInfof("gRPC stream: cleared cancellable session=%q", normalized)
+	normalised := normaliseSessionID(sessionID)
+	if _, ok := s.sessionCancels[normalised]; ok {
+		delete(s.sessionCancels, normalised)
+		logInfof("gRPC stream: cleared cancellable session=%q", normalised)
 	}
 }
 
@@ -684,14 +689,14 @@ func (s *peerControlServer) cancelSession(sessionID string) bool {
 	s.sessionMu.Lock()
 	defer s.sessionMu.Unlock()
 
-	normalized := normalizeSessionID(sessionID)
-	cancel, ok := s.sessionCancels[normalized]
+	normalised := normaliseSessionID(sessionID)
+	cancel, ok := s.sessionCancels[normalised]
 	if !ok {
-		logInfof("gRPC stream: cancel requested for non-active session=%q", normalized)
+		logInfof("gRPC stream: cancel requested for non-active session=%q", normalised)
 		return false
 	}
-	delete(s.sessionCancels, normalized)
-	logInfof("gRPC stream: canceling active session=%q", normalized)
+	delete(s.sessionCancels, normalised)
+	logInfof("gRPC stream: canceling active session=%q", normalised)
 	cancel()
 	return true
 }
@@ -727,7 +732,7 @@ func streamTarget(ctx context.Context) string {
 
 func (s *peerControlServer) StreamAudio(req *control.StreamPlaybackRequest, stream control.PeerControl_StreamAudioServer) error {
 	target := streamTarget(stream.Context())
-	streamFormat := normalizeStreamPlaybackRequest(req)
+	streamFormat := normaliseStreamPlaybackRequest(req)
 	logInfof("gRPC stream: server handler started session=%q audio_id=%q path=%q target=%s", req.SessionId, req.AudioId, req.AudioPath, target)
 
 	source, sourceName, closeSource, err := s.openStreamSource(req)
@@ -816,7 +821,7 @@ func (s *peerControlServer) StreamAudio(req *control.StreamPlaybackRequest, stre
 }
 
 func (s *peerControlServer) receiveAudioFromLeader(ctx context.Context, target string, req *control.StreamPlaybackRequest, sharedAt time.Time) error {
-	streamFormat := normalizeStreamPlaybackRequest(req)
+	streamFormat := normaliseStreamPlaybackRequest(req)
 	logInfof("gRPC stream: follower opening stream from leader target=%s session=%q audio_id=%q", target, req.SessionId, req.AudioId)
 
 	conn, err := grpc.NewClient(target, grpc.WithTransportCredentials(insecure.NewCredentials()))
@@ -833,12 +838,7 @@ func (s *peerControlServer) receiveAudioFromLeader(ctx context.Context, target s
 		return err
 	}
 
-	var offset time.Duration
-	select {
-	case currentOffset := <-s.offsetCh:
-		offset = currentOffset
-	default:
-	}
+	offset := s.currentOffset()
 
 	localPlaybackAt := syncutil.ConvertSharedTimeToLocal(sharedAt, offset)
 	playoutDelay := s.streamJitter
@@ -876,12 +876,11 @@ func (s *peerControlServer) receiveAudioFromLeader(ctx context.Context, target s
 	liveLogPath := ""
 	lastLiveErrorLogPath := ""
 	restartAttempted := false
-	terminateOnLiveFailure := true
 	startLiveSink := func(reason string) bool {
 		sink, closeFn, logPath, err := startStreamingPlaybackWithFormatAndLog(streamFormat, req.SessionId)
 		if err != nil {
 			if reason == "initial" {
-				logWarnf("gRPC stream: live playback unavailable for session=%q, will use temp file playback: %v", req.SessionId, err)
+				logWarnf("gRPC stream: live playback unavailable for session=%q: %v", req.SessionId, err)
 			} else {
 				logWarnf("gRPC stream: live playback restart failed for session=%q after %s: %v", req.SessionId, reason, err)
 			}
@@ -937,9 +936,6 @@ func (s *peerControlServer) receiveAudioFromLeader(ctx context.Context, target s
 		}
 	}
 	failDueToLivePlayback := func(trigger string) error {
-		if !terminateOnLiveFailure {
-			return nil
-		}
 		msg := fmt.Sprintf("gRPC stream: live playback unavailable after retry for session=%q (trigger=%s)", req.SessionId, trigger)
 		if lastLiveErrorLogPath != "" {
 			msg = fmt.Sprintf("%s (ffplay log: %s)", msg, lastLiveErrorLogPath)
@@ -948,23 +944,9 @@ func (s *peerControlServer) receiveAudioFromLeader(ctx context.Context, target s
 		return fmt.Errorf("%s", msg)
 	}
 
-	tempFile, err := os.CreateTemp("", fmt.Sprintf("silent-%s-%s-*.pcm", sanitizeForFilename(req.SessionId), sanitizeForFilename(req.AudioId)))
-	if err != nil {
-		logErrorf("gRPC stream: failed to create output file for session=%q: %v", req.SessionId, err)
-		return err
-	}
-	outputPath := tempFile.Name()
-	defer tempFile.Close()
-
 	writeAudio := func(payload []byte, seq int64, source string) error {
 		if len(payload) == 0 {
 			return nil
-		}
-		if _, err := tempFile.Write(payload); err != nil {
-			if liveSink != nil {
-				disableLiveSink("temp file write error", err)
-			}
-			return fmt.Errorf("write chunk (%s) seq=%d to %s: %w", source, seq, outputPath, err)
 		}
 
 		if liveSink == nil && !restartAttempted {
@@ -1449,77 +1431,10 @@ func (s *peerControlServer) receiveAudioFromLeader(ctx context.Context, target s
 				logWarnf("gRPC stream: live playback process ended with error for session=%q: %v", req.SessionId, err)
 			}
 		}()
-	} else {
-		playAt := startAt
-		if playAt.IsZero() {
-			playAt = time.Now()
-		}
-		go scheduleRawPlayback(playAt, outputPath, streamFormat)
 	}
 
-	logInfof("gRPC stream: leader stream finished target=%s session=%q chunks_received=%d output=%s", target, req.SessionId, chunksReceived, outputPath)
+	logInfof("gRPC stream: leader stream finished target=%s session=%q chunks_received=%d", target, req.SessionId, chunksReceived)
 	return nil
-}
-
-func (s *peerControlServer) streamAudioToPeer(ctx context.Context, target, sessionID, audioID, audioPath string, sharedAt time.Time) error {
-	logInfof("gRPC stream: opening client stream to target=%s session=%q audio_id=%q", target, sessionID, audioID)
-
-	conn, err := grpc.NewClient(target, grpc.WithTransportCredentials(insecure.NewCredentials()))
-	if err != nil {
-		logWarnf("gRPC stream: failed to connect to target=%s session=%q: %v", target, sessionID, err)
-		return err
-	}
-	defer conn.Close()
-
-	client := control.NewPeerControlClient(conn)
-	stream, err := client.StreamAudio(ctx, &control.StreamPlaybackRequest{
-		SessionId:     sessionID,
-		AudioId:       audioID,
-		AudioPath:     audioPath,
-		SharedAtNanos: sharedAt.UnixNano(),
-	})
-	if err != nil {
-		logWarnf("gRPC stream: failed to start client stream to target=%s session=%q: %v", target, sessionID, err)
-		return err
-	}
-
-	chunksReceived := 0
-	outputPath := fmt.Sprintf("/tmp/%s-%s.wav", sessionID, audioID)
-	f, err := os.Create(outputPath)
-	if err != nil {
-		logErrorf("gRPC stream: failed to create output file %s: %v", outputPath, err)
-		return err
-	}
-
-	for {
-		chunk, err := stream.Recv()
-		if err == io.EOF {
-			f.Close()
-			logInfof("gRPC stream: client stream finished target=%s session=%q chunks_received=%d output=%s", target, sessionID, chunksReceived, outputPath)
-			go schedulePlayback(time.Now().Add(100*time.Millisecond), outputPath)
-			return nil
-		}
-		if err != nil {
-			f.Close()
-			logErrorf("gRPC stream: receive error target=%s session=%q chunks_received=%d: %v", target, sessionID, chunksReceived, err)
-			return err
-		}
-		if chunk.EndOfStream {
-			f.Close()
-			logInfof("gRPC stream: received final chunk target=%s session=%q chunks_received=%d output=%s", target, sessionID, chunksReceived, outputPath)
-			go schedulePlayback(time.Now().Add(100*time.Millisecond), outputPath)
-			return nil
-		}
-
-		chunksReceived++
-		if _, err := f.Write(chunk.Data); err != nil {
-			f.Close()
-			logErrorf("gRPC stream: failed to write chunk to %s: %v", outputPath, err)
-			return err
-		}
-
-		logDebugf("gRPC stream: received chunk seq=%d size=%d target=%s session=%q", chunk.Sequence, len(chunk.Data), target, sessionID)
-	}
 }
 
 func sanitizeForFilename(value string) string {

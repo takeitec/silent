@@ -53,7 +53,7 @@ func startLiveCaptureSource(device string) (io.ReadCloser, func() error, error) 
 		return nil, nil, fmt.Errorf("ffmpeg is required for live capture")
 	}
 
-	dev := normalizeCaptureDevice(device)
+	dev := normaliseCaptureDevice(device)
 
 	var args []string
 	switch runtime.GOOS {
@@ -149,7 +149,7 @@ func defaultStreamFormat() streamFormat {
 	}
 }
 
-func normalizeStreamPlaybackRequest(req *control.StreamPlaybackRequest) streamFormat {
+func normaliseStreamPlaybackRequest(req *control.StreamPlaybackRequest) streamFormat {
 	format := defaultStreamFormat()
 
 	if req.GetSampleRate() > 0 {
@@ -169,7 +169,7 @@ func normalizeStreamPlaybackRequest(req *control.StreamPlaybackRequest) streamFo
 	return format
 }
 
-func normalizeCaptureDevice(device string) string {
+func normaliseCaptureDevice(device string) string {
 	dev := strings.TrimSpace(device)
 	if dev == "" {
 		return "default"
@@ -192,7 +192,7 @@ func captureInputFormat() (string, error) {
 }
 
 func validateCaptureDevice(device string) error {
-	dev := normalizeCaptureDevice(device)
+	dev := normaliseCaptureDevice(device)
 	if dev == "default" {
 		return nil
 	}

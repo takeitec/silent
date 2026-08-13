@@ -29,6 +29,18 @@ func TestBeginSessionRejectsDuplicateUntilLeaseExpires(t *testing.T) {
 	}
 }
 
+func TestBeginSessionUsesNormalisedSessionKey(t *testing.T) {
+	srv := &peerControlServer{}
+
+	if !srv.beginSession("  demo-session  ") {
+		t.Fatalf("expected first session start to succeed")
+	}
+
+	if srv.beginSession("demo-session") {
+		t.Fatalf("expected duplicate session start to be rejected when spacing differs")
+	}
+}
+
 func TestBeginSessionExpiresAfterLease(t *testing.T) {
 	originalLease := sessionLease
 	defer func() { sessionLease = originalLease }()

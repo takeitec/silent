@@ -20,7 +20,7 @@ func validateMediaRuntime(cfg config) error {
 			return err
 		}
 
-		logInfof("media check: live capture ready (input=%s device=%q)", format, normalizeCaptureDevice(cfg.captureDevice))
+		logInfof("media check: live capture ready (input=%s device=%q)", format, normaliseCaptureDevice(cfg.captureDevice))
 	}
 
 	if _, err := exec.LookPath("ffplay"); err != nil {

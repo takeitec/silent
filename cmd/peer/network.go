@@ -5,12 +5,38 @@ import (
 	"net"
 	"strconv"
 	"strings"
+	stdsync "sync"
 	"time"
 
 	"silent/internal/discovery"
 	"silent/internal/models"
 	"silent/internal/sync"
 )
+
+type latestOffset struct {
+	mu    stdsync.RWMutex
+	value time.Duration
+	set   bool
+}
+
+func (o *latestOffset) Set(value time.Duration) {
+	if o == nil {
+		return
+	}
+	o.mu.Lock()
+	o.value = value
+	o.set = true
+	o.mu.Unlock()
+}
+
+func (o *latestOffset) Get() (time.Duration, bool) {
+	if o == nil {
+		return 0, false
+	}
+	o.mu.RLock()
+	defer o.mu.RUnlock()
+	return o.value, o.set
+}
 
 func handleControl(listener *net.UDPConn, leader bool) error {
 	buf := make([]byte, 1024)
@@ -48,7 +74,7 @@ func handleControl(listener *net.UDPConn, leader bool) error {
 	}
 }
 
-func probeLeader(peer models.Peer, id string, controlPort int, offsetCh chan time.Duration) error {
+func probeLeader(peer models.Peer, id string, controlPort int, offsetState *latestOffset) error {
 	addr, err := parsePeerAddress(peer.Address, controlPort)
 	if err != nil {
 		return err
@@ -90,10 +116,7 @@ func probeLeader(peer models.Peer, id string, controlPort int, offsetCh chan tim
 		clientRecv,
 	)
 
-	select {
-	case offsetCh <- offset:
-	default:
-	}
+	offsetState.Set(offset)
 
 	logInfof("%s synced with leader, offset=%s", id, offset)
 	return nil

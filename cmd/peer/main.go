@@ -61,7 +61,7 @@ const (
 	logTimeRFC3339     = "rfc3339"
 )
 
-func normalizeLogOutput(mode string) string {
+func normaliseLogOutput(mode string) string {
 	switch strings.ToLower(strings.TrimSpace(mode)) {
 	case logOutputStdout, logOutputFile, logOutputBoth:
 		return strings.ToLower(strings.TrimSpace(mode))
@@ -70,7 +70,7 @@ func normalizeLogOutput(mode string) string {
 	}
 }
 
-func normalizeLogTimeFormat(value string) string {
+func normaliseLogTimeFormat(value string) string {
 	switch strings.ToLower(strings.TrimSpace(value)) {
 	case logTimeRFC3339:
 		return time.RFC3339
@@ -81,7 +81,7 @@ func normalizeLogTimeFormat(value string) string {
 	}
 }
 
-func normalizeLogLevel(value string) zapcore.Level {
+func normaliseLogLevel(value string) zapcore.Level {
 	switch strings.ToLower(strings.TrimSpace(value)) {
 	case "debug":
 		return zap.DebugLevel
@@ -111,9 +111,9 @@ func appendSessionSuffix(fileName, suffix string) string {
 }
 
 func configureAppLogging(cfg config) (func(), error) {
-	outputMode := normalizeLogOutput(cfg.logOutput)
-	timeFormat := normalizeLogTimeFormat(cfg.logTimeFormat)
-	logLevel := normalizeLogLevel(cfg.logLevel)
+	outputMode := normaliseLogOutput(cfg.logOutput)
+	timeFormat := normaliseLogTimeFormat(cfg.logTimeFormat)
+	logLevel := normaliseLogLevel(cfg.logLevel)
 
 	outputPaths := make([]string, 0, 2)
 	if outputMode == logOutputStdout || outputMode == logOutputBoth {
@@ -314,7 +314,7 @@ type peerApp struct {
 	pl         *peerlist.PeerList
 	ann        *discovery.Announcer
 	listener   *net.UDPConn
-	offsetCh   chan time.Duration
+	offsetState *latestOffset
 	grpcServer *peerControlServer
 	roomClient *discovery.Client
 }
@@ -353,11 +353,11 @@ func newPeerApp(cfg config) (*peerApp, error) {
 	}
 	logInfof("peer %s listening for control on udp:%d", cfg.id, controlPort)
 
-	offsetCh := make(chan time.Duration, 1)
+	offsetState := &latestOffset{}
 
 	chunkLogFilePath := ""
 	var chunkLogFile *os.File
-	fileMode := normalizeChunkLogMode(cfg.chunkLogFileMode)
+	fileMode := normaliseChunkLogMode(cfg.chunkLogFileMode)
 	if fileMode != chunkLogModeOff {
 		logDir := cfg.chunkLogDir
 		if logDir == "" {
@@ -381,11 +381,11 @@ func newPeerApp(cfg config) (*peerApp, error) {
 	}
 
 	return &peerApp{
-		cfg:      cfg,
-		pl:       pl,
-		ann:      ann,
-		listener: listener,
-		offsetCh: offsetCh,
+		cfg:         cfg,
+		pl:          pl,
+		ann:         ann,
+		listener:    listener,
+		offsetState: offsetState,
 		grpcServer: &peerControlServer{
 			id:                   cfg.id,
 			isLeader:             cfg.leader,
@@ -399,12 +399,12 @@ func newPeerApp(cfg config) (*peerApp, error) {
 			streamJitterMin:      cfg.streamJitterMin,
 			streamJitterMax:      cfg.streamJitterMax,
 			streamJitterStep:     cfg.streamJitterStep,
-			chunkLogStdoutMode:   normalizeChunkLogMode(cfg.chunkLogStdoutMode),
+			chunkLogStdoutMode:   normaliseChunkLogMode(cfg.chunkLogStdoutMode),
 			chunkLogFileMode:     fileMode,
 			chunkLogEvery:        cfg.chunkLogEvery,
 			chunkLogFilePath:     chunkLogFilePath,
 			chunkLogFile:         chunkLogFile,
-			offsetCh:             offsetCh,
+			offsetState:          offsetState,
 		},
 	}, nil
 }
@@ -572,7 +572,7 @@ func (a *peerApp) Run() error {
 				logInfof("follower %s discovered leader %s at %s", a.cfg.id, leader.ID, leader.Address)
 				lastLeaderDiscovery = currentLeaderDiscovery
 			}
-			if err := probeLeader(*leader, a.cfg.id, probePortForLeader(*leader, effectiveControlPort(a.cfg)), a.offsetCh); err != nil {
+			if err := probeLeader(*leader, a.cfg.id, probePortForLeader(*leader, effectiveControlPort(a.cfg)), a.offsetState); err != nil {
 				logWarnf("clock sync failed: %v", err)
 			}
 		}
