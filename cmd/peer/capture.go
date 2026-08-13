@@ -3,7 +3,6 @@ package main
 import (
 	"fmt"
 	"io"
-	"log"
 	"os/exec"
 	"path/filepath"
 	"runtime"
@@ -118,7 +117,7 @@ func startFFmpegPipe(args []string, sourceName string) (io.ReadCloser, func() er
 		return nil, nil, fmt.Errorf("ffmpeg stdout pipe: %w", err)
 	}
 
-	log.Printf("capture: source=%q", sourceName)
+	logInfof("capture: source=%q", sourceName)
 	logExecStart("capture", cmd)
 	if err := cmd.Start(); err != nil {
 		logExecError("capture", cmd, "start", err)

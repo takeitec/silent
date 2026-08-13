@@ -3,17 +3,17 @@ package main
 import (
 	"flag"
 	"fmt"
-	"io"
-	"log"
 	"net"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"sort"
 	"strings"
-	"sync"
 	"syscall"
 	"time"
+
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
 
 	"silent/internal/discovery"
 	"silent/internal/models"
@@ -41,9 +41,12 @@ type config struct {
 	chunkLogDir          string
 	chunkLogEvery        int
 	logOutput            string
+	logLevel             string
 	logDir               string
 	logFileName          string
 	logTimeFormat        string
+	logPerSession        bool
+	logSessionStamp      string
 	room                 bool
 	roomURL              string
 	advertiseHost        string
@@ -57,32 +60,6 @@ const (
 	logTimeRFC3339Nano = "rfc3339nano"
 	logTimeRFC3339     = "rfc3339"
 )
-
-type timestampedLogWriter struct {
-	mu         sync.Mutex
-	w          io.Writer
-	timeFormat string
-}
-
-func (tw *timestampedLogWriter) Write(p []byte) (int, error) {
-	tw.mu.Lock()
-	defer tw.mu.Unlock()
-
-	text := strings.TrimRight(string(p), "\n")
-	if text == "" {
-		return len(p), nil
-	}
-
-	lines := strings.Split(text, "\n")
-	for _, line := range lines {
-		ts := time.Now().Format(tw.timeFormat)
-		if _, err := fmt.Fprintf(tw.w, "%s %s\n", ts, line); err != nil {
-			return 0, err
-		}
-	}
-
-	return len(p), nil
-}
 
 func normalizeLogOutput(mode string) string {
 	switch strings.ToLower(strings.TrimSpace(mode)) {
@@ -104,16 +81,45 @@ func normalizeLogTimeFormat(value string) string {
 	}
 }
 
-func configureAppLogging(cfg config) (*os.File, error) {
-	outputMode := normalizeLogOutput(cfg.logOutput)
-	timeFormat := normalizeLogTimeFormat(cfg.logTimeFormat)
+func normalizeLogLevel(value string) zapcore.Level {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "debug":
+		return zap.DebugLevel
+	case "info":
+		return zap.InfoLevel
+	case "warn", "warning":
+		return zap.WarnLevel
+	case "error":
+		return zap.ErrorLevel
+	default:
+		return zap.DebugLevel
+	}
+}
 
-	var outputs []io.Writer
-	if outputMode == logOutputStdout || outputMode == logOutputBoth {
-		outputs = append(outputs, os.Stdout)
+func appendSessionSuffix(fileName, suffix string) string {
+	if strings.TrimSpace(fileName) == "" || strings.TrimSpace(suffix) == "" {
+		return fileName
 	}
 
-	var logFile *os.File
+	ext := filepath.Ext(fileName)
+	base := strings.TrimSuffix(fileName, ext)
+	if base == "" {
+		base = "log"
+	}
+
+	return fmt.Sprintf("%s-%s%s", base, suffix, ext)
+}
+
+func configureAppLogging(cfg config) (func(), error) {
+	outputMode := normalizeLogOutput(cfg.logOutput)
+	timeFormat := normalizeLogTimeFormat(cfg.logTimeFormat)
+	logLevel := normalizeLogLevel(cfg.logLevel)
+
+	outputPaths := make([]string, 0, 2)
+	if outputMode == logOutputStdout || outputMode == logOutputBoth {
+		outputPaths = append(outputPaths, "stdout")
+	}
+
 	if outputMode == logOutputFile || outputMode == logOutputBoth {
 		logDir := strings.TrimSpace(cfg.logDir)
 		if logDir == "" {
@@ -127,53 +133,81 @@ func configureAppLogging(cfg config) (*os.File, error) {
 		if fileName == "" {
 			fileName = fmt.Sprintf("silent-peer-%s.log", sanitizeForFilename(cfg.id))
 		}
+		fileName = appendSessionSuffix(fileName, cfg.logSessionStamp)
 
 		logPath := filepath.Join(logDir, fileName)
-		f, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
-		if err != nil {
-			return nil, fmt.Errorf("open log file %q: %w", logPath, err)
+		outputPaths = append(outputPaths, logPath)
+	}
+
+	if len(outputPaths) == 0 {
+		outputPaths = append(outputPaths, "stdout")
+	}
+
+	zapCfg := zap.Config{
+		Level:       zap.NewAtomicLevelAt(logLevel),
+		Development: false,
+		Encoding:    "console",
+		EncoderConfig: zapcore.EncoderConfig{
+			MessageKey:     "msg",
+			LevelKey:       "level",
+			TimeKey:        "ts",
+			NameKey:        "logger",
+			CallerKey:      "caller",
+			StacktraceKey:  "stacktrace",
+			LineEnding:     zapcore.DefaultLineEnding,
+			EncodeLevel:    zapcore.LowercaseLevelEncoder,
+			EncodeTime:     zapcore.TimeEncoderOfLayout(timeFormat),
+			EncodeDuration: zapcore.StringDurationEncoder,
+			EncodeCaller:   zapcore.ShortCallerEncoder,
+		},
+		OutputPaths:       outputPaths,
+		ErrorOutputPaths:  outputPaths,
+		DisableCaller:     true,
+		DisableStacktrace: true,
+	}
+
+	logger, err := zapCfg.Build()
+	if err != nil {
+		return nil, fmt.Errorf("build zap logger: %w", err)
+	}
+
+	undoStdLog := zap.RedirectStdLog(logger)
+	zap.ReplaceGlobals(logger)
+
+	cleanup := func() {
+		undoStdLog()
+		_ = logger.Sync()
+	}
+
+	if outputMode == logOutputFile || outputMode == logOutputBoth {
+		if len(outputPaths) > 0 {
+			logInfof("app log: output=%s level=%s file=%s", outputMode, logLevel.String(), outputPaths[len(outputPaths)-1])
 		}
-		logFile = f
-		outputs = append(outputs, f)
-	}
-
-	if len(outputs) == 0 {
-		outputs = append(outputs, os.Stdout)
-	}
-
-	log.SetFlags(0)
-	log.SetOutput(&timestampedLogWriter{
-		w:          io.MultiWriter(outputs...),
-		timeFormat: timeFormat,
-	})
-
-	if logFile != nil {
-		log.Printf("app log: output=%s file=%s", outputMode, logFile.Name())
 	} else {
-		log.Printf("app log: output=%s", outputMode)
+		logInfof("app log: output=%s level=%s", outputMode, logLevel.String())
 	}
 
-	return logFile, nil
+	return cleanup, nil
 }
 
 func main() {
 	cfg := parseFlags()
 
-	appLogFile, err := configureAppLogging(cfg)
+	logCleanup, err := configureAppLogging(cfg)
 	if err != nil {
-		log.Fatalf("configure logging: %v", err)
+		logFatalf("configure logging: %v", err)
 	}
-	if appLogFile != nil {
-		defer appLogFile.Close()
+	if logCleanup != nil {
+		defer logCleanup()
 	}
 
 	app, err := newPeerApp(cfg)
 	if err != nil {
-		log.Fatalf("create peer app: %v", err)
+		logFatalf("create peer app: %v", err)
 	}
 
 	if err := app.Run(); err != nil {
-		log.Fatalf("peer app: %v", err)
+		logFatalf("peer app: %v", err)
 	}
 }
 
@@ -198,9 +232,11 @@ func parseFlags() config {
 	chunkLogDir := flag.String("stream-chunk-log-dir", "logs", "directory for stream chunk log files")
 	chunkLogEvery := flag.Int("stream-chunk-log-every", 100, "milestone interval for stream chunk logs")
 	logOutput := flag.String("log-output", "both", "application log output mode: stdout|file|both")
+	logLevel := flag.String("log-level", "debug", "application log level: debug|info|warn|error")
 	logDir := flag.String("log-dir", "logs", "directory for application log files")
 	logFileName := flag.String("log-file", "", "application log filename (default: silent-peer-<id>.log)")
 	logTimeFormat := flag.String("log-time-format", "rfc3339nano", "application log timestamp format: rfc3339nano|rfc3339")
+	logPerSession := flag.Bool("log-per-session", true, "append a per-run timestamp suffix to app and stream chunk log filenames")
 	room := flag.Bool("room", true, "use room-based discovery instead of UDP broadcast")
 	roomURL := flag.String("room-url", "http://127.0.0.1:9100", "room service base URL")
 	advertiseHost := flag.String("advertise-host", "", "override the host advertised to other peers")
@@ -235,6 +271,11 @@ func parseFlags() config {
 		every = 50
 	}
 
+	logSessionStamp := ""
+	if *logPerSession {
+		logSessionStamp = time.Now().UTC().Format("20060102T150405Z")
+	}
+
 	return config{
 		id:                   *id,
 		broadcastIP:          *broadcastIP,
@@ -256,9 +297,12 @@ func parseFlags() config {
 		chunkLogDir:          *chunkLogDir,
 		chunkLogEvery:        every,
 		logOutput:            *logOutput,
+		logLevel:             *logLevel,
 		logDir:               *logDir,
 		logFileName:          *logFileName,
 		logTimeFormat:        *logTimeFormat,
+		logPerSession:        *logPerSession,
+		logSessionStamp:      logSessionStamp,
 		room:                 *room,
 		roomURL:              *roomURL,
 		advertiseHost:        *advertiseHost,
@@ -295,7 +339,7 @@ func newPeerApp(cfg config) (*peerApp, error) {
 			host = h
 		}
 		pl.Add(p.ID, host, p.Role, 0)
-		log.Printf("discovered peer %s (%s) role=%s", p.ID, host, p.Role)
+		logInfof("discovered peer %s (%s) role=%s", p.ID, host, p.Role)
 	})
 
 	controlPort := effectiveControlPort(cfg)
@@ -307,7 +351,7 @@ func newPeerApp(cfg config) (*peerApp, error) {
 	if err != nil {
 		return nil, err
 	}
-	log.Printf("peer %s listening for control on udp:%d", cfg.id, controlPort)
+	logInfof("peer %s listening for control on udp:%d", cfg.id, controlPort)
 
 	offsetCh := make(chan time.Duration, 1)
 
@@ -320,16 +364,18 @@ func newPeerApp(cfg config) (*peerApp, error) {
 			logDir = "logs"
 		}
 		if err := os.MkdirAll(logDir, 0o755); err != nil {
-			log.Printf("chunk log: failed to create log directory %q: %v", logDir, err)
+			logErrorf("chunk log: failed to create log directory %q: %v", logDir, err)
 		} else {
-			chunkLogFilePath = filepath.Join(logDir, fmt.Sprintf("silent-stream-chunks-%s.log", sanitizeForFilename(cfg.id)))
+			chunkFileName := fmt.Sprintf("silent-stream-chunks-%s.log", sanitizeForFilename(cfg.id))
+			chunkFileName = appendSessionSuffix(chunkFileName, cfg.logSessionStamp)
+			chunkLogFilePath = filepath.Join(logDir, chunkFileName)
 			f, err := os.OpenFile(chunkLogFilePath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
 			if err != nil {
-				log.Printf("chunk log: failed to open file %q: %v", chunkLogFilePath, err)
+				logErrorf("chunk log: failed to open file %q: %v", chunkLogFilePath, err)
 				chunkLogFilePath = ""
 			} else {
 				chunkLogFile = f
-				log.Printf("chunk log: file=%s mode=%s", chunkLogFilePath, fileMode)
+				logInfof("chunk log: file=%s mode=%s", chunkLogFilePath, fileMode)
 			}
 		}
 	}
@@ -406,7 +452,7 @@ func (a *peerApp) Run() error {
 		go func() {
 			for {
 				if err := a.ann.Announce(); err != nil {
-					log.Printf("announce failed: %v", err)
+					logWarnf("announce failed: %v", err)
 				}
 				time.Sleep(1 * time.Second)
 			}
@@ -414,25 +460,25 @@ func (a *peerApp) Run() error {
 
 		go func() {
 			if err := a.ann.Start(); err != nil {
-				log.Printf("discovery stopped: %v", err)
+				logInfof("discovery stopped: %v", err)
 			}
 		}()
 	}
 
 	go func() {
 		if err := handleControl(a.listener, a.cfg.leader); err != nil {
-			log.Printf("control loop stopped: %v", err)
+			logInfof("control loop stopped: %v", err)
 		}
 	}()
 
 	go func() {
 		if err := startGRPCServer(fmt.Sprintf("0.0.0.0:%d", a.cfg.grpcPort), a.grpcServer); err != nil {
-			log.Printf("gRPC server stopped: %v", err)
+			logInfof("gRPC server stopped: %v", err)
 		}
 	}()
 
 	if a.cfg.leader {
-		log.Println("leader mode enabled")
+		logInfo("leader mode enabled")
 	}
 	if a.cfg.room {
 		roomURL := a.cfg.roomURL
@@ -455,7 +501,7 @@ func (a *peerApp) Run() error {
 			for range ticker.C {
 				state, err := a.roomClient.RoomState()
 				if err != nil {
-					log.Printf("room state lookup failed: %v", err)
+					logWarnf("room state lookup failed: %v", err)
 					continue
 				}
 
@@ -471,13 +517,13 @@ func (a *peerApp) Run() error {
 				roomStateSig := fmt.Sprintf("leader=%s peers=%d [%s]", state.Leader, len(state.Peers), strings.Join(peerSigs, ","))
 
 				if roomStateSig != lastRoomStateSig {
-					log.Printf("room state: leader=%s peers=%d", state.Leader, len(state.Peers))
+					logInfof("room state: leader=%s peers=%d", state.Leader, len(state.Peers))
 					lastRoomStateSig = roomStateSig
 				}
 				if currentLeaderInfo != "" && currentLeaderInfo != lastLeaderInfo {
 					parts := strings.SplitN(currentLeaderInfo, "|", 2)
 					if len(parts) == 2 {
-						log.Printf("leader is %s at %s", parts[0], parts[1])
+						logInfof("leader is %s at %s", parts[0], parts[1])
 					}
 					lastLeaderInfo = currentLeaderInfo
 				}
@@ -494,7 +540,7 @@ func (a *peerApp) Run() error {
 		}()
 	}
 
-	log.Printf("peer %s listening on udp:%d (control:%d)\n", a.cfg.id, a.cfg.port, effectiveControlPort(a.cfg))
+	logInfof("peer %s listening on udp:%d (control:%d)", a.cfg.id, a.cfg.port, effectiveControlPort(a.cfg))
 
 	go func() {
 		if a.cfg.leader {
@@ -515,7 +561,7 @@ func (a *peerApp) Run() error {
 			if !shouldProbeLeader(a.cfg, leader) {
 				if leader == nil {
 					if lastLeaderDiscovery != "" {
-						log.Printf("follower %s has not discovered a leader yet", a.cfg.id)
+						logInfof("follower %s has not discovered a leader yet", a.cfg.id)
 					}
 					lastLeaderDiscovery = ""
 				}
@@ -523,11 +569,11 @@ func (a *peerApp) Run() error {
 			}
 
 			if currentLeaderDiscovery != lastLeaderDiscovery {
-				log.Printf("follower %s discovered leader %s at %s", a.cfg.id, leader.ID, leader.Address)
+				logInfof("follower %s discovered leader %s at %s", a.cfg.id, leader.ID, leader.Address)
 				lastLeaderDiscovery = currentLeaderDiscovery
 			}
 			if err := probeLeader(*leader, a.cfg.id, probePortForLeader(*leader, effectiveControlPort(a.cfg)), a.offsetCh); err != nil {
-				log.Printf("clock sync failed: %v", err)
+				logWarnf("clock sync failed: %v", err)
 			}
 		}
 	}()
@@ -537,6 +583,6 @@ func (a *peerApp) Run() error {
 	<-sigCh
 
 	a.ann.Stop()
-	log.Println("shutting down")
+	logInfo("shutting down")
 	return nil
 }

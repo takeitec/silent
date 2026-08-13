@@ -3,7 +3,6 @@ package main
 import (
 	"fmt"
 	"io"
-	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -23,7 +22,7 @@ func schedulePlayback(at time.Time, wavPath string) {
 			logExecStart("playback", cmd)
 			if err := cmd.Start(); err != nil {
 				logExecError("playback", cmd, "start", err)
-				log.Printf("playback failed: %v", err)
+				logErrorf("playback failed: %v", err)
 			}
 			return
 		}
@@ -33,12 +32,12 @@ func schedulePlayback(at time.Time, wavPath string) {
 			logExecStart("playback", cmd)
 			if err := cmd.Start(); err != nil {
 				logExecError("playback", cmd, "start", err)
-				log.Printf("playback failed: %v", err)
+				logErrorf("playback failed: %v", err)
 			}
 			return
 		}
 
-		log.Printf("no audio player available for %s", wavPath)
+		logWarnf("no audio player available for %s", wavPath)
 		return
 	}
 
@@ -69,7 +68,7 @@ func scheduleRawPlayback(at time.Time, audioPath string, format streamFormat) {
 		logExecStart("raw-playback", cmd)
 		if err := cmd.Start(); err != nil {
 			logExecError("raw-playback", cmd, "start", err)
-			log.Printf("raw playback failed: %v", err)
+			logErrorf("raw playback failed: %v", err)
 		}
 		return
 	}
@@ -79,12 +78,12 @@ func scheduleRawPlayback(at time.Time, audioPath string, format streamFormat) {
 		logExecStart("raw-playback", cmd)
 		if err := cmd.Start(); err != nil {
 			logExecError("raw-playback", cmd, "start", err)
-			log.Printf("raw playback failed: %v", err)
+			logErrorf("raw playback failed: %v", err)
 		}
 		return
 	}
 
-	log.Printf("no raw audio player available for %s", audioPath)
+	logWarnf("no raw audio player available for %s", audioPath)
 }
 
 func startStreamingPlaybackWithFormat(format streamFormat) (io.WriteCloser, func() error, error) {

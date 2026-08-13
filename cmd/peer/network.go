@@ -2,7 +2,6 @@ package main
 
 import (
 	"fmt"
-	"log"
 	"net"
 	"strconv"
 	"strings"
@@ -44,7 +43,7 @@ func handleControl(listener *net.UDPConn, leader bool) error {
 			serverSend := time.Now()
 			response := fmt.Sprintf("SYNC-ACK|%d|%d", recv.UnixNano(), serverSend.UnixNano())
 			_, _ = listener.WriteToUDP([]byte(response), addr)
-			log.Printf("leader received sync ping from %s\n", addr.String())
+			logDebugf("leader received sync ping from %s", addr.String())
 		}
 	}
 }
@@ -96,7 +95,7 @@ func probeLeader(peer models.Peer, id string, controlPort int, offsetCh chan tim
 	default:
 	}
 
-	log.Printf("%s synced with leader, offset=%s\n", id, offset)
+	logInfof("%s synced with leader, offset=%s", id, offset)
 	return nil
 }
 
@@ -134,7 +133,7 @@ func validateBroadcastIP(raw string) (string, error) {
 	}
 
 	if ip.To4() == nil {
-		return "", fmt.Errorf("invalid broadcast IP %q: IPv6 is not supported here", raw)
+		return "", fmt.Errorf("invalid broadcast IP %q: IPv6 `is `not supported here", raw)
 	}
 
 	if ip.IsLoopback() || ip.IsUnspecified() {
@@ -184,7 +183,7 @@ func registerWithRoom(cfg config, roomURL string) *discovery.Client {
 	go func() {
 		for {
 			if err := client.Register(10 * time.Second); err != nil {
-				log.Printf("room register failed: %v", err)
+				logWarnf("room register failed: %v", err)
 				time.Sleep(2 * time.Second)
 				continue
 			}

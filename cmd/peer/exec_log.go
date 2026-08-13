@@ -1,7 +1,6 @@
 package main
 
 import (
-	"log"
 	"os/exec"
 )
 
@@ -18,7 +17,7 @@ func logExecStart(kind string, cmd *exec.Cmd) {
 	if cmd == nil {
 		return
 	}
-	log.Printf("exec: starting %s command: %s", kind, cmd.String())
+	logInfof("exec: starting %s command: %s", kind, cmd.String())
 }
 
 func logExecError(kind string, cmd *exec.Cmd, stage string, err error) {
@@ -29,8 +28,8 @@ func logExecError(kind string, cmd *exec.Cmd, stage string, err error) {
 		return
 	}
 	if cmd != nil {
-		log.Printf("exec: %s command failed during %s: %v (%s)", kind, stage, err, cmd.String())
+		logWarnf("exec: %s command failed during %s: %v (%s)", kind, stage, err, cmd.String())
 		return
 	}
-	log.Printf("exec: %s command failed during %s: %v", kind, stage, err)
+	logWarnf("exec: %s command failed during %s: %v", kind, stage, err)
 }
