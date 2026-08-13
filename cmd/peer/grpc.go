@@ -455,9 +455,34 @@ func (s *peerControlServer) StopStreamPlayback(ctx context.Context, req *control
 	}
 
 	// Leader path: if this peer is the leader, it should fan out the stop request to all followers and stop its own session.
+	stopped, fanoutCount, stopErrors := s.stopLeaderSession(ctx, sessionID, reason)
+	if stopped {
+		logInfof("gRPC stream: leader stopped local session=%q", sessionID)
+	} else {
+		logInfof("gRPC stream: leader had no active local session=%q to stop", sessionID)
+	}
+
+	msg := fmt.Sprintf("stop broadcast to %d follower(s)", fanoutCount)
+	if stopErrors > 0 {
+		msg = fmt.Sprintf("%s with %d error(s)", msg, stopErrors)
+	}
+	logWarnf("gRPC stream: leader completed stop fanout for session=%q followers=%d errors=%d", sessionID, fanoutCount, stopErrors)
+	return &control.StopStreamResponse{Accepted: stopErrors == 0, SessionId: sessionID, Message: msg}, nil
+}
+
+func (s *peerControlServer) stopLeaderSession(ctx context.Context, sessionID, reason string) (bool, int, int) {
+	if !s.isLeader {
+		return false, 0, 0
+	}
+	if _, ok := s.loadLeaderStream(sessionID); !ok {
+		return false, 0, 0
+	}
+
+	s.clearLeaderStream(sessionID)
+	logInfof("gRPC stream: leader beginning stop fanout for session=%q reason=%q", sessionID, reason)
+
 	fanoutCount := 0
 	stopErrors := 0
-	logInfof("gRPC stream: leader beginning stop fanout for session=%q", sessionID)
 	for _, p := range s.pl.Peers() {
 		if p.ID == s.id || p.Role == models.RoleLeader {
 			continue
@@ -497,20 +522,9 @@ func (s *peerControlServer) StopStreamPlayback(ctx context.Context, req *control
 		logInfof("gRPC stream: leader stop fanout acknowledged follower=%s session=%q", p.ID, sessionID)
 	}
 
-	if s.cancelSession(sessionID) {
-		s.finishSession(sessionID)
-		logInfof("gRPC stream: leader stopped local session=%q", sessionID)
-	} else {
-		logInfof("gRPC stream: leader had no active local session=%q to stop", sessionID)
-	}
-	s.clearLeaderStream(sessionID)
-
-	msg := fmt.Sprintf("stop broadcast to %d follower(s)", fanoutCount)
-	if stopErrors > 0 {
-		msg = fmt.Sprintf("%s with %d error(s)", msg, stopErrors)
-	}
-	logWarnf("gRPC stream: leader completed stop fanout for session=%q followers=%d errors=%d", sessionID, fanoutCount, stopErrors)
-	return &control.StopStreamResponse{Accepted: stopErrors == 0, SessionId: sessionID, Message: msg}, nil
+	s.finishSession(sessionID)
+	logInfof("gRPC stream: leader stopped local session=%q", sessionID)
+	return true, fanoutCount, stopErrors
 }
 
 var sessionLease = 30 * time.Second
@@ -737,6 +751,9 @@ func (s *peerControlServer) StreamAudio(req *control.StreamPlaybackRequest, stre
 
 	source, sourceName, closeSource, err := s.openStreamSource(req)
 	if err != nil {
+			if s.isLeader {
+				s.stopLeaderSession(context.Background(), req.SessionId, err.Error())
+			}
 		return err
 	}
 	defer func() {
@@ -757,6 +774,7 @@ func (s *peerControlServer) StreamAudio(req *control.StreamPlaybackRequest, stre
 	for {
 		n, err := io.ReadFull(source, buf)
 		if n > 0 {
+			producedAt := time.Now()
 			if paceStream {
 				now := time.Now()
 				if nextSendAt.IsZero() {
@@ -775,13 +793,15 @@ func (s *peerControlServer) StreamAudio(req *control.StreamPlaybackRequest, stre
 				}
 			}
 
+			sentAt := time.Now()
 			chunk := &control.AudioChunk{
-				SessionId:   req.SessionId,
-				AudioId:     req.AudioId,
-				Sequence:    seq,
-				Data:        append([]byte(nil), buf[:n]...),
-				SentAtNanos: time.Now().UnixNano(),
-				EndOfStream: false,
+				SessionId:       req.SessionId,
+				AudioId:         req.AudioId,
+				Sequence:        seq,
+				Data:            append([]byte(nil), buf[:n]...),
+				SentAtNanos:     sentAt.UnixNano(),
+				ProducedAtNanos: producedAt.UnixNano(),
+				EndOfStream:     false,
 			}
 			if err := stream.Send(chunk); err != nil {
 				logWarnf("gRPC stream: failed to send chunk seq=%d session=%q target=%s: %v", seq, req.SessionId, target, err)
@@ -796,9 +816,20 @@ func (s *peerControlServer) StreamAudio(req *control.StreamPlaybackRequest, stre
 		}
 
 		if err == io.EOF || err == io.ErrUnexpectedEOF {
+			if sourceName == "live-capture" {
+				err := fmt.Errorf("live capture ended unexpectedly")
+				logWarnf("gRPC stream: live capture ended for session=%q chunks_sent=%d: %v", req.SessionId, chunksSent, err)
+				if s.isLeader {
+					s.stopLeaderSession(context.Background(), req.SessionId, err.Error())
+				}
+				return err
+			}
 			break
 		}
 		if err != nil {
+			if s.isLeader {
+				s.stopLeaderSession(context.Background(), req.SessionId, fmt.Sprintf("capture read failed: %v", err))
+			}
 			logWarnf("gRPC stream: read error from source=%s for session=%q: %v", sourceName, req.SessionId, err)
 			return err
 		}
@@ -944,7 +975,14 @@ func (s *peerControlServer) receiveAudioFromLeader(ctx context.Context, target s
 		return fmt.Errorf("%s", msg)
 	}
 
-	writeAudio := func(payload []byte, seq int64, source string) error {
+	type queuedChunk struct {
+		data       []byte
+		receivedAt time.Time
+		producedAt time.Time
+		sentAt     time.Time
+	}
+
+	writeAudio := func(payload []byte, seq int64, source string, scheduledAt time.Time, queued queuedChunk) error {
 		if len(payload) == 0 {
 			return nil
 		}
@@ -959,6 +997,7 @@ func (s *peerControlServer) receiveAudioFromLeader(ctx context.Context, target s
 		}
 
 		if liveSink != nil {
+			sinkWriteAt := time.Now()
 			if _, err := liveSink.Write(payload); err != nil {
 				disableLiveSink(fmt.Sprintf("live write (%s) seq=%d", source, seq), err)
 				attemptRestart(fmt.Sprintf("live write (%s) seq=%d", source, seq))
@@ -967,6 +1006,13 @@ func (s *peerControlServer) receiveAudioFromLeader(ctx context.Context, target s
 						return err
 					}
 				}
+			} else if !queued.receivedAt.IsZero() && !scheduledAt.IsZero() {
+				metrics.ObserveRecvToScheduled(scheduledAt.Sub(queued.receivedAt))
+				metrics.ObserveScheduledToWrite(sinkWriteAt.Sub(scheduledAt))
+				if !queued.producedAt.IsZero() {
+					metrics.ObserveProducedToScheduled(scheduledAt.Sub(queued.producedAt))
+					metrics.ObserveProducedToWrite(sinkWriteAt.Sub(queued.producedAt))
+				}
 			}
 		}
 
@@ -974,9 +1020,9 @@ func (s *peerControlServer) receiveAudioFromLeader(ctx context.Context, target s
 	}
 
 	type recvEnvelope struct {
-		chunk *control.AudioChunk
-		err   error
-		at    time.Time
+		chunk      *control.AudioChunk
+		err        error
+		receivedAt time.Time
 	}
 
 	recvCh := make(chan recvEnvelope, 32)
@@ -984,7 +1030,7 @@ func (s *peerControlServer) receiveAudioFromLeader(ctx context.Context, target s
 		defer close(recvCh)
 		for {
 			chunk, recvErr := stream.Recv()
-			recvCh <- recvEnvelope{chunk: chunk, err: recvErr, at: time.Now()}
+			recvCh <- recvEnvelope{chunk: chunk, err: recvErr, receivedAt: time.Now()}
 			if recvErr != nil {
 				return
 			}
@@ -994,7 +1040,7 @@ func (s *peerControlServer) receiveAudioFromLeader(ctx context.Context, target s
 		}
 	}()
 
-	pending := make(map[int64][]byte)
+	pending := make(map[int64]queuedChunk)
 	initialized := false
 	playoutStarted := false
 	requestedStart := !sharedAt.IsZero() && req.GetSharedAtNanos() > 0
@@ -1109,7 +1155,7 @@ func (s *peerControlServer) receiveAudioFromLeader(ctx context.Context, target s
 	logHealth := func(stage string) {
 		queueDelay := currentQueueDelay()
 		delayError := queueDelay - playoutDelay
-		logDebugf("gRPC stream: health stage=%s session=%q target=%s received=%d played=%d late_dropped=%d duplicate_dropped=%d underflows=%d gap_silence=%d catchup_resyncs=%d hard_resyncs=%d buffered=%d expected_seq=%d queue_delay=%s delay_error=%s one_way=%s",
+		logDebugf("gRPC stream: health stage=%s session=%q target=%s received=%d played=%d late_dropped=%d duplicate_dropped=%d underflows=%d gap_silence=%d catchup_resyncs=%d hard_resyncs=%d buffered=%d expected_seq=%d queue_delay=%s delay_error=%s one_way=%s produced_to_recv=%s recv_to_scheduled=%s scheduled_to_sink_write=%s produced_to_scheduled=%s produced_to_sink_write=%s send_block=%s",
 			stage,
 			req.SessionId,
 			target,
@@ -1126,6 +1172,12 @@ func (s *peerControlServer) receiveAudioFromLeader(ctx context.Context, target s
 			queueDelay,
 			delayError,
 			metrics.OneWaySummary(),
+			metrics.ProducedToRecvSummary(),
+			metrics.RecvToScheduledSummary(),
+			metrics.ScheduledToWriteSummary(),
+			metrics.ProducedToScheduledSummary(),
+			metrics.ProducedToWriteSummary(),
+			metrics.SendBlockSummary(),
 		)
 	}
 
@@ -1160,17 +1212,17 @@ func (s *peerControlServer) receiveAudioFromLeader(ctx context.Context, target s
 				break
 			}
 
-			if data, ok := pending[expectedSeq]; ok {
+			if queued, ok := pending[expectedSeq]; ok {
 				delete(pending, expectedSeq)
 				missingSeqHoldCount = 0
 				metrics.PlayedChunks++
-				if err := writeAudio(data, expectedSeq, "chunk"); err != nil {
+				if err := writeAudio(queued.data, expectedSeq, "chunk", nextPlayoutAt, queued); err != nil {
 					return err
 				}
 			} else {
 				metrics.Underflows++
 				metrics.GapFillSilence++
-				if err := writeAudio(silenceChunk, expectedSeq, "silence-gap"); err != nil {
+				if err := writeAudio(silenceChunk, expectedSeq, "silence-gap", nextPlayoutAt, queuedChunk{}); err != nil {
 					return err
 				}
 				if eosSeen || missingSeqHoldCount >= missingSeqHoldChunks {
@@ -1358,10 +1410,10 @@ func (s *peerControlServer) receiveAudioFromLeader(ctx context.Context, target s
 
 			chunksReceived++
 			metrics.ReceivedChunks++
-			lastChunkAt = env.at
+			lastChunkAt = env.receivedAt
 			if !firstChunkLogged {
 				firstChunkLogged = true
-				firstArrival := env.at
+				firstArrival := env.receivedAt
 				startAt = firstArrival.Add(playoutDelay)
 				if requestedStart && localPlaybackAt.After(startAt) {
 					startAt = localPlaybackAt
@@ -1378,15 +1430,15 @@ func (s *peerControlServer) receiveAudioFromLeader(ctx context.Context, target s
 				initialized = true
 			}
 
+			seq := chunk.GetSequence()
+			var sentLocal time.Time
 			if chunk.GetSentAtNanos() > 0 {
-				sentLocal := syncutil.ConvertSharedTimeToLocal(time.Unix(0, chunk.GetSentAtNanos()), offset)
-				oneWay := env.at.Sub(sentLocal)
+				sentLocal = syncutil.ConvertSharedTimeToLocal(time.Unix(0, chunk.GetSentAtNanos()), offset)
+				oneWay := env.receivedAt.Sub(sentLocal)
 				if oneWay >= 0 {
 					metrics.ObserveOneWay(oneWay)
 				}
 			}
-
-			seq := chunk.GetSequence()
 			if seq > latestSeqReceived {
 				latestSeqReceived = seq
 			}
@@ -1398,7 +1450,20 @@ func (s *peerControlServer) receiveAudioFromLeader(ctx context.Context, target s
 				metrics.DuplicateDropped++
 				continue
 			}
-			pending[seq] = append([]byte(nil), chunk.GetData()...)
+			queued := queuedChunk{
+				data:       append([]byte(nil), chunk.GetData()...),
+				receivedAt: env.receivedAt,
+				sentAt:     sentLocal,
+			}
+			if chunk.GetProducedAtNanos() > 0 {
+				producedLocal := syncutil.ConvertSharedTimeToLocal(time.Unix(0, chunk.GetProducedAtNanos()), offset)
+				queued.producedAt = producedLocal
+				metrics.ObserveProducedToRecv(env.receivedAt.Sub(producedLocal))
+				if !queued.sentAt.IsZero() {
+					metrics.ObserveSendBlock(queued.sentAt.Sub(producedLocal))
+				}
+			}
+			pending[seq] = queued
 			if depth := len(pending); depth > metrics.MaxBufferedChunks {
 				metrics.MaxBufferedChunks = depth
 			}
@@ -1413,13 +1478,13 @@ func (s *peerControlServer) receiveAudioFromLeader(ctx context.Context, target s
 				}
 			}
 
-			if err := drainReady(env.at); err != nil {
+			if err := drainReady(env.receivedAt); err != nil {
 				logHealth("drain-error")
 				return err
 			}
 
 			extra := fmt.Sprintf("buffered=%d queue_delay=%s delay_error=%s", len(pending), currentQueueDelay(), lastDelayError)
-			s.logChunkEvent("buffered", req.SessionId, target, seq, len(chunk.GetData()), streamFormat.ChunkBytes, extra)
+			s.logChunkEvent("buffered", req.SessionId, target, chunk.GetSequence(), len(chunk.GetData()), streamFormat.ChunkBytes, extra)
 		}
 	}
 

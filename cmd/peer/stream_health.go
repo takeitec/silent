@@ -6,6 +6,103 @@ import (
 	"time"
 )
 
+var delayHistogramBounds = []time.Duration{
+	1 * time.Millisecond,
+	2 * time.Millisecond,
+	5 * time.Millisecond,
+	10 * time.Millisecond,
+	20 * time.Millisecond,
+	30 * time.Millisecond,
+	40 * time.Millisecond,
+	50 * time.Millisecond,
+	75 * time.Millisecond,
+	100 * time.Millisecond,
+	150 * time.Millisecond,
+	200 * time.Millisecond,
+	300 * time.Millisecond,
+	400 * time.Millisecond,
+	500 * time.Millisecond,
+	750 * time.Millisecond,
+	1 * time.Second,
+	1500 * time.Millisecond,
+	2 * time.Second,
+	3 * time.Second,
+	5 * time.Second,
+}
+
+type delaySummary struct {
+	samples int64
+	total   time.Duration
+	min     time.Duration
+	max     time.Duration
+	buckets []int64
+}
+
+func newDelaySummary() delaySummary {
+	return delaySummary{min: -1, buckets: make([]int64, len(delayHistogramBounds)+1)}
+}
+
+func (d *delaySummary) Observe(delay time.Duration) {
+	if delay < 0 {
+		return
+	}
+	if d.samples == 0 {
+		d.min = delay
+		d.max = delay
+	} else {
+		if delay < d.min {
+			d.min = delay
+		}
+		if delay > d.max {
+			d.max = delay
+		}
+	}
+	d.samples++
+	d.total += delay
+	for idx, bound := range delayHistogramBounds {
+		if delay <= bound {
+			d.buckets[idx]++
+			return
+		}
+	}
+	d.buckets[len(d.buckets)-1]++
+}
+
+func (d delaySummary) percentile(numerator, denominator int64) time.Duration {
+	if d.samples == 0 {
+		return 0
+	}
+	rank := (d.samples*numerator + denominator - 1) / denominator
+	seen := int64(0)
+	for idx, count := range d.buckets {
+		seen += count
+		if seen >= rank {
+			if idx < len(delayHistogramBounds) {
+				return delayHistogramBounds[idx]
+			}
+			return delayHistogramBounds[len(delayHistogramBounds)-1]
+		}
+	}
+	return d.max
+}
+
+func (d delaySummary) Summary() string {
+	if d.samples == 0 {
+		return "samples=0"
+	}
+	avg := d.total / time.Duration(d.samples)
+	return fmt.Sprintf("samples=%d avg=%s min=%s p50=%s p90=%s p95=%s p99=%s max=%s",
+		d.samples,
+		avg,
+		d.min,
+		d.percentile(50, 100),
+		d.percentile(90, 100),
+		d.percentile(95, 100),
+		d.percentile(99, 100),
+		d.max,
+	)
+}
+
 type streamHealthMetrics struct {
 	TargetJitterDelay time.Duration
 	ReceivedChunks    int64
@@ -17,49 +114,83 @@ type streamHealthMetrics struct {
 	CatchupResyncs    int64
 	HardResyncs       int64
 	MaxBufferedChunks int
-	oneWaySamples     int64
-	oneWayTotal       time.Duration
-	oneWayMin         time.Duration
-	oneWayMax         time.Duration
+	oneWay            delaySummary
+	producedToRecv    delaySummary
+	recvToScheduled   delaySummary
+	scheduledToWrite  delaySummary
+	producedToSched   delaySummary
+	producedToWrite   delaySummary
+	sendBlock         delaySummary
 }
 
 func newStreamHealthMetrics(targetDelay time.Duration) streamHealthMetrics {
-	return streamHealthMetrics{TargetJitterDelay: targetDelay}
+	return streamHealthMetrics{
+		TargetJitterDelay: targetDelay,
+		oneWay:            newDelaySummary(),
+		producedToRecv:    newDelaySummary(),
+		recvToScheduled:   newDelaySummary(),
+		scheduledToWrite:  newDelaySummary(),
+		producedToSched:   newDelaySummary(),
+		producedToWrite:   newDelaySummary(),
+		sendBlock:         newDelaySummary(),
+	}
 }
 
 func (m *streamHealthMetrics) ObserveOneWay(delay time.Duration) {
-	if delay < 0 {
-		return
-	}
-	if m.oneWaySamples == 0 {
-		m.oneWayMin = delay
-		m.oneWayMax = delay
-	} else {
-		if delay < m.oneWayMin {
-			m.oneWayMin = delay
-		}
-		if delay > m.oneWayMax {
-			m.oneWayMax = delay
-		}
-	}
-	m.oneWaySamples++
-	m.oneWayTotal += delay
+	m.oneWay.Observe(delay)
 }
 
 func (m streamHealthMetrics) OneWaySummary() string {
-	parts := []string{fmt.Sprintf("target_jitter=%s", m.TargetJitterDelay)}
-	if m.oneWaySamples == 0 {
-		parts = append(parts, "samples=0")
-		return strings.Join(parts, " ")
-	}
-	avg := m.oneWayTotal / time.Duration(m.oneWaySamples)
-	parts = append(parts,
-		fmt.Sprintf("samples=%d", m.oneWaySamples),
-		fmt.Sprintf("avg=%s", avg),
-		fmt.Sprintf("min=%s", m.oneWayMin),
-		fmt.Sprintf("max=%s", m.oneWayMax),
-	)
+	parts := []string{fmt.Sprintf("target_jitter=%s", m.TargetJitterDelay), m.oneWay.Summary()}
 	return strings.Join(parts, " ")
+}
+
+func (m *streamHealthMetrics) ObserveProducedToRecv(delay time.Duration) {
+	m.producedToRecv.Observe(delay)
+}
+
+func (m streamHealthMetrics) ProducedToRecvSummary() string {
+	return m.producedToRecv.Summary()
+}
+
+func (m *streamHealthMetrics) ObserveRecvToScheduled(delay time.Duration) {
+	m.recvToScheduled.Observe(delay)
+}
+
+func (m streamHealthMetrics) RecvToScheduledSummary() string {
+	return m.recvToScheduled.Summary()
+}
+
+func (m *streamHealthMetrics) ObserveScheduledToWrite(delay time.Duration) {
+	m.scheduledToWrite.Observe(delay)
+}
+
+func (m streamHealthMetrics) ScheduledToWriteSummary() string {
+	return m.scheduledToWrite.Summary()
+}
+
+func (m *streamHealthMetrics) ObserveProducedToScheduled(delay time.Duration) {
+	m.producedToSched.Observe(delay)
+}
+
+func (m streamHealthMetrics) ProducedToScheduledSummary() string {
+	return m.producedToSched.Summary()
+}
+
+func (m *streamHealthMetrics) ObserveProducedToWrite(delay time.Duration) {
+	m.producedToWrite.Observe(delay)
+}
+
+func (m streamHealthMetrics) ProducedToWriteSummary() string {
+	return m.producedToWrite.Summary()
+}
+
+func (m *streamHealthMetrics) ObserveSendBlock(delay time.Duration) {
+	m.sendBlock.Observe(delay)
+}
+
+func (m streamHealthMetrics) SendBlockSummary() string {
+	return m.sendBlock.Summary()
 }
 
 func streamChunkDuration(format streamFormat) time.Duration {

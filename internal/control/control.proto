@@ -85,4 +85,5 @@ message AudioChunk {
   bytes data = 4;
   bool end_of_stream = 5;
   int64 sent_at_nanos = 6;
+  int64 produced_at_nanos = 7;
 }
