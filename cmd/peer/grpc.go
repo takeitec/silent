@@ -28,31 +28,32 @@ import (
 type peerControlServer struct {
 	control.UnimplementedPeerControlServer
 
-	id                     string
-	isLeader               bool
-	pl                     *peerlist.PeerList
-	grpcPort               int
-	wavPath                string
-	liveCapture            bool
-	captureDevice          string
-	streamJitter           time.Duration
-	streamJitterAdaptive   bool
-	streamJitterSoftResync bool
-	streamJitterMin        time.Duration
-	streamJitterMax        time.Duration
-	streamJitterStep       time.Duration
-	chunkLogStdoutMode     string
-	chunkLogFileMode       string
-	chunkLogEvery          int
-	chunkLogFilePath       string
-	chunkLogFile           *os.File
-	chunkLogMu             stdsync.Mutex
-	offsetState            *latestOffset
-	sessionMu              stdsync.Mutex
-	activeSessions         map[string]time.Time
-	sessionCancels         map[string]context.CancelFunc
-	leaderStreams          map[string]*control.StreamPlaybackRequest
-	leaderSharedStreams    map[string]*leaderSharedStream
+	id                          string
+	isLeader                    bool
+	pl                          *peerlist.PeerList
+	grpcPort                    int
+	wavPath                     string
+	liveCapture                 bool
+	captureDevice               string
+	streamJitter                time.Duration
+	streamJitterAdaptive        bool
+	streamJitterSoftResync      bool
+	streamJitterDriftCorrection bool
+	streamJitterMin             time.Duration
+	streamJitterMax             time.Duration
+	streamJitterStep            time.Duration
+	chunkLogStdoutMode          string
+	chunkLogFileMode            string
+	chunkLogEvery               int
+	chunkLogFilePath            string
+	chunkLogFile                *os.File
+	chunkLogMu                  stdsync.Mutex
+	offsetState                 *latestOffset
+	sessionMu                   stdsync.Mutex
+	activeSessions              map[string]time.Time
+	sessionCancels              map[string]context.CancelFunc
+	leaderStreams               map[string]*control.StreamPlaybackRequest
+	leaderSharedStreams         map[string]*leaderSharedStream
 }
 
 const (
@@ -1364,6 +1365,7 @@ func (s *peerControlServer) receiveAudioFromLeader(ctx context.Context, target s
 	}
 	adaptiveEnabled := s.streamJitterAdaptive
 	softResyncEnabled := s.streamJitterSoftResync
+	driftCorrectionEnabled := s.streamJitterDriftCorrection
 	adaptiveMin := s.streamJitterMin
 	adaptiveMax := s.streamJitterMax
 	adaptiveStep := s.streamJitterStep
@@ -1563,10 +1565,24 @@ func (s *peerControlServer) receiveAudioFromLeader(ctx context.Context, target s
 	lastSoftControlAt := time.Time{}
 	lastAdaptiveResetAt := time.Time{}
 	controllerMode := "normal"
+	playoutIntervalCorrection := time.Duration(0)
+	driftCorrectionActive := false
+	driftCorrectionPeak := time.Duration(0)
+	driftCorrectionActiveSince := time.Time{}
+	driftCorrectionActiveTotal := time.Duration(0)
+	driftCorrectionEpisodes := 0
+	driftEvidenceSampleAt := time.Time{}
+	driftEvidenceBacklog := 0
+	driftEvidenceSign := 0
+	driftEvidenceWindows := 0
+	pendingSoftNudgeAt := time.Time{}
+	pendingSoftNudgeError := time.Duration(0)
+	pendingSoftNudgeStep := time.Duration(0)
 	prevBacklogSample := 0
 	prevBacklogSampleAt := time.Time{}
 	steepBacklogGrowth := false
 	steepBacklogGrowthWindows := 0
+	emergencyStartedAt := time.Time{}
 
 	const maxPlayoutStepsPerDrain = 8
 	const receiveStallLogInterval = 2 * time.Second
@@ -1630,6 +1646,13 @@ func (s *peerControlServer) receiveAudioFromLeader(ctx context.Context, target s
 	const softResyncBand = 160 * time.Millisecond
 	const recoveringEnterBand = 240 * time.Millisecond
 	const recoveringExitBand = 120 * time.Millisecond
+	const driftCorrectionMaxFraction = 0.001
+	const driftCorrectionMinFraction = 0.0001
+	const driftCorrectionExitBand = 80 * time.Millisecond
+	const driftCorrectionWarmup = 10 * time.Second
+	const driftEvidenceSampleInterval = 1 * time.Second
+	const driftEvidenceRequiredWindows = 5
+	const softNudgeVerificationDelay = 500 * time.Millisecond
 	const softResyncMinStep = 8 * time.Millisecond
 	const softResyncMaxStep = 12 * time.Millisecond
 	const softResyncGain = 0.07
@@ -1653,6 +1676,14 @@ func (s *peerControlServer) receiveAudioFromLeader(ctx context.Context, target s
 			return 0
 		}
 		return time.Duration(len(pending)) * chunkDur
+	}
+
+	playoutInterval := func() time.Duration {
+		interval := chunkDur + playoutIntervalCorrection
+		if interval <= 0 {
+			return chunkDur
+		}
+		return interval
 	}
 
 	contiguousBufferedChunks := func() int {
@@ -1745,7 +1776,11 @@ func (s *peerControlServer) receiveAudioFromLeader(ctx context.Context, target s
 		bufferedPlayable := contiguousBufferedChunks()
 		queueDelayPlayable := time.Duration(bufferedPlayable) * chunkDur
 		delayErrorPlayable := queueDelayPlayable - playoutDelay
-		logDebugf("gRPC stream: health stage=%s session=%q target=%s received=%d played=%d late_dropped=%d duplicate_dropped=%d underflows=%d gap_silence=%d catchup_resyncs=%d hard_resyncs=%d buffered_total=%d buffered_playable=%d expected_seq=%d queue_delay_total=%s queue_delay_playable=%s delay_error_total=%s delay_error_playable=%s ewma_delay_error=%s one_way=%s produced_to_recv=%s recv_to_scheduled=%s scheduled_to_sink_write=%s produced_to_scheduled=%s produced_to_sink_write=%s send_block=%s",
+		driftCorrectionActiveTotalSnapshot := driftCorrectionActiveTotal
+		if !driftCorrectionActiveSince.IsZero() {
+			driftCorrectionActiveTotalSnapshot += time.Since(driftCorrectionActiveSince)
+		}
+		logDebugf("gRPC stream: health stage=%s session=%q target=%s received=%d played=%d late_dropped=%d duplicate_dropped=%d underflows=%d gap_silence=%d catchup_resyncs=%d hard_resyncs=%d buffered_total=%d buffered_playable=%d expected_seq=%d queue_delay_total=%s queue_delay_playable=%s delay_error_total=%s delay_error_playable=%s ewma_delay_error=%s playout_interval=%s drift_correction_peak=%s drift_correction_active_total=%s drift_correction_episodes=%d one_way=%s produced_to_recv=%s recv_to_scheduled=%s scheduled_to_sink_write=%s produced_to_scheduled=%s produced_to_sink_write=%s send_block=%s",
 			stage,
 			req.SessionId,
 			target,
@@ -1765,6 +1800,10 @@ func (s *peerControlServer) receiveAudioFromLeader(ctx context.Context, target s
 			delayErrorTotal,
 			delayErrorPlayable,
 			ewmaDelayError,
+			playoutInterval(),
+			driftCorrectionPeak,
+			driftCorrectionActiveTotalSnapshot,
+			driftCorrectionEpisodes,
 			metrics.OneWaySummary(),
 			metrics.ProducedToRecvSummary(),
 			metrics.RecvToScheduledSummary(),
@@ -1826,7 +1865,7 @@ func (s *peerControlServer) receiveAudioFromLeader(ctx context.Context, target s
 					missingSeqHoldCount++
 				}
 
-				nextPlayoutAt = nextPlayoutAt.Add(chunkDur)
+				nextPlayoutAt = nextPlayoutAt.Add(playoutInterval())
 
 				if eosSeen && expectedSeq > endSeq && len(pending) == 0 {
 					return nil
@@ -1835,7 +1874,7 @@ func (s *peerControlServer) receiveAudioFromLeader(ctx context.Context, target s
 			}
 
 			expectedSeq++
-			nextPlayoutAt = nextPlayoutAt.Add(chunkDur)
+			nextPlayoutAt = nextPlayoutAt.Add(playoutInterval())
 
 			if eosSeen && expectedSeq > endSeq && len(pending) == 0 {
 				return nil
@@ -1856,6 +1895,12 @@ func (s *peerControlServer) receiveAudioFromLeader(ctx context.Context, target s
 			if err := drainReady(now); err != nil {
 				logHealth("drain-error")
 				return err
+			}
+			if !pendingSoftNudgeAt.IsZero() && now.Sub(pendingSoftNudgeAt) >= softNudgeVerificationDelay {
+				postNudgeError := currentQueueDelay() - playoutDelay
+				errorDelta := postNudgeError - pendingSoftNudgeError
+				logDebugf("gRPC stream: soft resync verification session=%q target=%s step=%s pre_error=%s post_error=%s error_delta=%s moved_toward_zero=%v", req.SessionId, target, pendingSoftNudgeStep, pendingSoftNudgeError, postNudgeError, errorDelta, absoluteDuration(postNudgeError) < absoluteDuration(pendingSoftNudgeError))
+				pendingSoftNudgeAt = time.Time{}
 			}
 
 			emergency := false
@@ -1915,6 +1960,13 @@ func (s *peerControlServer) receiveAudioFromLeader(ctx context.Context, target s
 				if newMode != controllerMode {
 					if newMode == "emergency" || controllerMode == "emergency" {
 						logInfof("gRPC stream: controller mode changed session=%q target=%s from=%s to=%s delay_error=%s backlog_chunks=%d stalled=%v severe_delay=%v steep_growth=%v", req.SessionId, target, controllerMode, newMode, delayErrorRaw, chunkBacklog, isStalled, isSevereDelay, steepBacklogGrowth)
+					}
+					if newMode == "emergency" {
+						emergencyStartedAt = now
+						logInfof("gRPC stream: emergency started session=%q target=%s reason_stalled=%v reason_severe_delay=%v reason_steep_growth=%v delay_error=%s backlog_chunks=%d", req.SessionId, target, isStalled, isSevereDelay, steepBacklogGrowth, delayErrorRaw, chunkBacklog)
+					} else if controllerMode == "emergency" && !emergencyStartedAt.IsZero() {
+						logInfof("gRPC stream: emergency ended session=%q target=%s duration=%s next_mode=%s delay_error=%s backlog_chunks=%d", req.SessionId, target, now.Sub(emergencyStartedAt), newMode, delayErrorRaw, chunkBacklog)
+						emergencyStartedAt = time.Time{}
 					}
 					controllerMode = newMode
 				}
@@ -1982,6 +2034,9 @@ func (s *peerControlServer) receiveAudioFromLeader(ctx context.Context, target s
 							nextPlayoutAt = nextPlayoutAt.Add(step)
 							lastSoftResyncAt = now
 							lastSoftControlAt = now
+							pendingSoftNudgeAt = now
+							pendingSoftNudgeError = delayErrorRaw
+							pendingSoftNudgeStep = step
 
 							// Soft nudges can temporarily perturb underflow/catchup counters.
 							// Reset adaptive window baselines on meaningful nudges so the
@@ -2010,6 +2065,77 @@ func (s *peerControlServer) receiveAudioFromLeader(ctx context.Context, target s
 				} else if softResyncEnabled {
 					softResyncSignWindows = 0
 					lastSoftResyncSign = 0
+				}
+
+				errorMagnitude := absoluteDuration(delayErrorEWMA)
+				if !driftCorrectionEnabled {
+					driftCorrectionActive = false
+					playoutIntervalCorrection = 0
+					driftEvidenceSampleAt = time.Time{}
+					driftEvidenceWindows = 0
+				} else if !driftCorrectionActive && now.Sub(playoutStartedAt) >= driftCorrectionWarmup {
+					if driftEvidenceSampleAt.IsZero() || now.Sub(driftEvidenceSampleAt) >= driftEvidenceSampleInterval {
+						driftSign := 0
+						if delayErrorEWMA > softResyncBand {
+							driftSign = 1
+						} else if delayErrorEWMA < -softResyncBand {
+							driftSign = -1
+						}
+						backlogDelta := chunkBacklog - driftEvidenceBacklog
+						trendAgrees := (driftSign > 0 && backlogDelta > 0) || (driftSign < 0 && backlogDelta < 0)
+						if driftSign != 0 && trendAgrees {
+							if driftSign == driftEvidenceSign {
+								driftEvidenceWindows++
+							} else {
+								driftEvidenceSign = driftSign
+								driftEvidenceWindows = 1
+							}
+						} else {
+							driftEvidenceSign = 0
+							driftEvidenceWindows = 0
+						}
+						driftEvidenceBacklog = chunkBacklog
+						driftEvidenceSampleAt = now
+						if driftEvidenceWindows >= driftEvidenceRequiredWindows {
+							driftCorrectionActive = true
+						}
+					}
+				} else if !driftCorrectionActive && now.Sub(playoutStartedAt) < driftCorrectionWarmup {
+					driftEvidenceSampleAt = time.Time{}
+					driftEvidenceBacklog = chunkBacklog
+					driftEvidenceSign = 0
+					driftEvidenceWindows = 0
+				}
+				if driftCorrectionEnabled && driftCorrectionActive && errorMagnitude <= driftCorrectionExitBand {
+					driftCorrectionActive = false
+				}
+				if driftCorrectionActive {
+					excess := float64(errorMagnitude-driftCorrectionExitBand) / float64(softResyncProportionalCeiling-driftCorrectionExitBand)
+					if excess < driftCorrectionMinFraction/driftCorrectionMaxFraction {
+						excess = driftCorrectionMinFraction / driftCorrectionMaxFraction
+					}
+					if excess > 1 {
+						excess = 1
+					}
+					correction := time.Duration(float64(chunkDur) * driftCorrectionMaxFraction * excess)
+					if delayErrorEWMA > 0 {
+						correction = -correction
+					}
+					playoutIntervalCorrection = correction
+				} else {
+					playoutIntervalCorrection = 0
+				}
+				if playoutIntervalCorrection != 0 {
+					if driftCorrectionActiveSince.IsZero() {
+						driftCorrectionActiveSince = now
+						driftCorrectionEpisodes++
+					}
+					if absoluteDuration(playoutIntervalCorrection) > absoluteDuration(driftCorrectionPeak) {
+						driftCorrectionPeak = playoutIntervalCorrection
+					}
+				} else if !driftCorrectionActiveSince.IsZero() {
+					driftCorrectionActiveTotal += now.Sub(driftCorrectionActiveSince)
+					driftCorrectionActiveSince = time.Time{}
 				}
 			}
 
