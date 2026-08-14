@@ -21,35 +21,36 @@ import (
 )
 
 type config struct {
-	id                   string
-	broadcastIP          string
-	port                 int
-	controlPort          int
-	grpcPort             int
-	leader               bool
-	wavPath              string
-	liveCapture          bool
-	captureDevice        string
-	logMediaCmds         bool
-	streamJitter         time.Duration
-	streamJitterAdaptive bool
-	streamJitterMin      time.Duration
-	streamJitterMax      time.Duration
-	streamJitterStep     time.Duration
-	chunkLogStdoutMode   string
-	chunkLogFileMode     string
-	chunkLogDir          string
-	chunkLogEvery        int
-	logOutput            string
-	logLevel             string
-	logDir               string
-	logFileName          string
-	logTimeFormat        string
-	logPerSession        bool
-	logSessionStamp      string
-	room                 bool
-	roomURL              string
-	advertiseHost        string
+	id                     string
+	broadcastIP            string
+	port                   int
+	controlPort            int
+	grpcPort               int
+	leader                 bool
+	wavPath                string
+	liveCapture            bool
+	captureDevice          string
+	logMediaCmds           bool
+	streamJitter           time.Duration
+	streamJitterAdaptive   bool
+	streamJitterSoftResync bool
+	streamJitterMin        time.Duration
+	streamJitterMax        time.Duration
+	streamJitterStep       time.Duration
+	chunkLogStdoutMode     string
+	chunkLogFileMode       string
+	chunkLogDir            string
+	chunkLogEvery          int
+	logOutput              string
+	logLevel               string
+	logDir                 string
+	logFileName            string
+	logTimeFormat          string
+	logPerSession          bool
+	logSessionStamp        string
+	room                   bool
+	roomURL                string
+	advertiseHost          string
 }
 
 const (
@@ -224,6 +225,7 @@ func parseFlags() config {
 	logMediaCmds := flag.Bool("log-media-cmds", true, "log ffmpeg/ffplay/aplay commands before execution and on failures")
 	streamJitterMS := flag.Int("stream-jitter-ms", 200, "target jitter buffer delay for streamed playback in milliseconds")
 	streamJitterAdaptive := flag.Bool("stream-jitter-adaptive", true, "adapt jitter buffer delay at runtime based on stream health")
+	streamJitterSoftResync := flag.Bool("stream-jitter-soft-resync", true, "apply soft playout resync nudges alongside adaptive jitter")
 	streamJitterMinMS := flag.Int("stream-jitter-min-ms", 50, "minimum adaptive jitter delay in milliseconds")
 	streamJitterMaxMS := flag.Int("stream-jitter-max-ms", 400, "maximum adaptive jitter delay in milliseconds")
 	streamJitterStepMS := flag.Int("stream-jitter-step-ms", 20, "adaptive jitter adjustment step in milliseconds")
@@ -277,46 +279,47 @@ func parseFlags() config {
 	}
 
 	return config{
-		id:                   *id,
-		broadcastIP:          *broadcastIP,
-		port:                 *port,
-		controlPort:          *controlPortFlag,
-		grpcPort:             *grpcPort,
-		leader:               *leader,
-		wavPath:              *wavPath,
-		liveCapture:          *liveCapture,
-		captureDevice:        *captureDevice,
-		logMediaCmds:         *logMediaCmds,
-		streamJitter:         jitter,
-		streamJitterAdaptive: *streamJitterAdaptive,
-		streamJitterMin:      adaptiveMin,
-		streamJitterMax:      adaptiveMax,
-		streamJitterStep:     adaptiveStep,
-		chunkLogStdoutMode:   *chunkLogStdoutMode,
-		chunkLogFileMode:     *chunkLogFileMode,
-		chunkLogDir:          *chunkLogDir,
-		chunkLogEvery:        every,
-		logOutput:            *logOutput,
-		logLevel:             *logLevel,
-		logDir:               *logDir,
-		logFileName:          *logFileName,
-		logTimeFormat:        *logTimeFormat,
-		logPerSession:        *logPerSession,
-		logSessionStamp:      logSessionStamp,
-		room:                 *room,
-		roomURL:              *roomURL,
-		advertiseHost:        *advertiseHost,
+		id:                     *id,
+		broadcastIP:            *broadcastIP,
+		port:                   *port,
+		controlPort:            *controlPortFlag,
+		grpcPort:               *grpcPort,
+		leader:                 *leader,
+		wavPath:                *wavPath,
+		liveCapture:            *liveCapture,
+		captureDevice:          *captureDevice,
+		logMediaCmds:           *logMediaCmds,
+		streamJitter:           jitter,
+		streamJitterAdaptive:   *streamJitterAdaptive,
+		streamJitterSoftResync: *streamJitterSoftResync,
+		streamJitterMin:        adaptiveMin,
+		streamJitterMax:        adaptiveMax,
+		streamJitterStep:       adaptiveStep,
+		chunkLogStdoutMode:     *chunkLogStdoutMode,
+		chunkLogFileMode:       *chunkLogFileMode,
+		chunkLogDir:            *chunkLogDir,
+		chunkLogEvery:          every,
+		logOutput:              *logOutput,
+		logLevel:               *logLevel,
+		logDir:                 *logDir,
+		logFileName:            *logFileName,
+		logTimeFormat:          *logTimeFormat,
+		logPerSession:          *logPerSession,
+		logSessionStamp:        logSessionStamp,
+		room:                   *room,
+		roomURL:                *roomURL,
+		advertiseHost:          *advertiseHost,
 	}
 }
 
 type peerApp struct {
-	cfg        config
-	pl         *peerlist.PeerList
-	ann        *discovery.Announcer
-	listener   *net.UDPConn
+	cfg         config
+	pl          *peerlist.PeerList
+	ann         *discovery.Announcer
+	listener    *net.UDPConn
 	offsetState *latestOffset
-	grpcServer *peerControlServer
-	roomClient *discovery.Client
+	grpcServer  *peerControlServer
+	roomClient  *discovery.Client
 }
 
 func newPeerApp(cfg config) (*peerApp, error) {
@@ -387,24 +390,25 @@ func newPeerApp(cfg config) (*peerApp, error) {
 		listener:    listener,
 		offsetState: offsetState,
 		grpcServer: &peerControlServer{
-			id:                   cfg.id,
-			isLeader:             cfg.leader,
-			pl:                   pl,
-			grpcPort:             cfg.grpcPort,
-			wavPath:              cfg.wavPath,
-			liveCapture:          cfg.liveCapture,
-			captureDevice:        cfg.captureDevice,
-			streamJitter:         cfg.streamJitter,
-			streamJitterAdaptive: cfg.streamJitterAdaptive,
-			streamJitterMin:      cfg.streamJitterMin,
-			streamJitterMax:      cfg.streamJitterMax,
-			streamJitterStep:     cfg.streamJitterStep,
-			chunkLogStdoutMode:   normaliseChunkLogMode(cfg.chunkLogStdoutMode),
-			chunkLogFileMode:     fileMode,
-			chunkLogEvery:        cfg.chunkLogEvery,
-			chunkLogFilePath:     chunkLogFilePath,
-			chunkLogFile:         chunkLogFile,
-			offsetState:          offsetState,
+			id:                     cfg.id,
+			isLeader:               cfg.leader,
+			pl:                     pl,
+			grpcPort:               cfg.grpcPort,
+			wavPath:                cfg.wavPath,
+			liveCapture:            cfg.liveCapture,
+			captureDevice:          cfg.captureDevice,
+			streamJitter:           cfg.streamJitter,
+			streamJitterAdaptive:   cfg.streamJitterAdaptive,
+			streamJitterSoftResync: cfg.streamJitterSoftResync,
+			streamJitterMin:        cfg.streamJitterMin,
+			streamJitterMax:        cfg.streamJitterMax,
+			streamJitterStep:       cfg.streamJitterStep,
+			chunkLogStdoutMode:     normaliseChunkLogMode(cfg.chunkLogStdoutMode),
+			chunkLogFileMode:       fileMode,
+			chunkLogEvery:          cfg.chunkLogEvery,
+			chunkLogFilePath:       chunkLogFilePath,
+			chunkLogFile:           chunkLogFile,
+			offsetState:            offsetState,
 		},
 	}, nil
 }

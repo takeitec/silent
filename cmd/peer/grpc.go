@@ -28,30 +28,31 @@ import (
 type peerControlServer struct {
 	control.UnimplementedPeerControlServer
 
-	id                   string
-	isLeader             bool
-	pl                   *peerlist.PeerList
-	grpcPort             int
-	wavPath              string
-	liveCapture          bool
-	captureDevice        string
-	streamJitter         time.Duration
-	streamJitterAdaptive bool
-	streamJitterMin      time.Duration
-	streamJitterMax      time.Duration
-	streamJitterStep     time.Duration
-	chunkLogStdoutMode   string
-	chunkLogFileMode     string
-	chunkLogEvery        int
-	chunkLogFilePath     string
-	chunkLogFile         *os.File
-	chunkLogMu           stdsync.Mutex
-	offsetState          *latestOffset
-	sessionMu            stdsync.Mutex
-	activeSessions       map[string]time.Time
-	sessionCancels       map[string]context.CancelFunc
-	leaderStreams        map[string]*control.StreamPlaybackRequest
-	leaderSharedStreams  map[string]*leaderSharedStream
+	id                     string
+	isLeader               bool
+	pl                     *peerlist.PeerList
+	grpcPort               int
+	wavPath                string
+	liveCapture            bool
+	captureDevice          string
+	streamJitter           time.Duration
+	streamJitterAdaptive   bool
+	streamJitterSoftResync bool
+	streamJitterMin        time.Duration
+	streamJitterMax        time.Duration
+	streamJitterStep       time.Duration
+	chunkLogStdoutMode     string
+	chunkLogFileMode       string
+	chunkLogEvery          int
+	chunkLogFilePath       string
+	chunkLogFile           *os.File
+	chunkLogMu             stdsync.Mutex
+	offsetState            *latestOffset
+	sessionMu              stdsync.Mutex
+	activeSessions         map[string]time.Time
+	sessionCancels         map[string]context.CancelFunc
+	leaderStreams          map[string]*control.StreamPlaybackRequest
+	leaderSharedStreams    map[string]*leaderSharedStream
 }
 
 const (
@@ -1362,6 +1363,7 @@ func (s *peerControlServer) receiveAudioFromLeader(ctx context.Context, target s
 		playoutDelay = 200 * time.Millisecond
 	}
 	adaptiveEnabled := s.streamJitterAdaptive
+	softResyncEnabled := s.streamJitterSoftResync
 	adaptiveMin := s.streamJitterMin
 	adaptiveMax := s.streamJitterMax
 	adaptiveStep := s.streamJitterStep
@@ -1379,6 +1381,9 @@ func (s *peerControlServer) receiveAudioFromLeader(ctx context.Context, target s
 	}
 	if playoutDelay > adaptiveMax {
 		playoutDelay = adaptiveMax
+	}
+	if !softResyncEnabled {
+		logInfof("gRPC stream: soft resync disabled session=%q target=%s initial_delay=%s", req.SessionId, target, playoutDelay)
 	}
 	chunkDur := streamChunkDuration(streamFormat)
 	silenceChunk := make([]byte, streamFormat.ChunkBytes)
@@ -1554,6 +1559,14 @@ func (s *peerControlServer) receiveAudioFromLeader(ctx context.Context, target s
 	ewmaDelayErrorInitialized := false
 	softResyncSignWindows := 0
 	lastSoftResyncSign := 0
+	lastAdaptiveControlAt := time.Time{}
+	lastSoftControlAt := time.Time{}
+	lastAdaptiveResetAt := time.Time{}
+	controllerMode := "normal"
+	prevBacklogSample := 0
+	prevBacklogSampleAt := time.Time{}
+	steepBacklogGrowth := false
+	steepBacklogGrowthWindows := 0
 
 	const maxPlayoutStepsPerDrain = 8
 	const receiveStallLogInterval = 2 * time.Second
@@ -1561,7 +1574,62 @@ func (s *peerControlServer) receiveAudioFromLeader(ctx context.Context, target s
 	const adaptiveTuneInterval = 5 * time.Second
 	const adaptiveDecreaseStableWindows = 2
 	const adaptiveIncreaseIssueWindows = 2
+	const adaptiveResetOnSoftNudgeMinStep = 10 * time.Millisecond
+	const adaptiveResetOnSoftNudgeMinInterval = 5 * time.Second
+	// adaptiveEmergencyTuneInterval lets adaptive re-evaluate much faster than
+	// adaptiveTuneInterval while the controller is in emergency mode, so it can
+	// react to a stall or backlog blowup within a second or two instead of five.
+	const adaptiveEmergencyTuneInterval = 1 * time.Second
+	// emergencyStallThreshold/emergencyQueueDelayThreshold/backlogSteepGrowthChunksPerSec
+	// define "emergency mode": conditions severe enough that the normal mutual
+	// quiet-gating between soft resync and adaptive jitter should be bypassed so
+	// whichever controller can react fastest is allowed to.
+	const emergencyStallThreshold = 1200 * time.Millisecond
+	const emergencyQueueDelayThreshold = 700 * time.Millisecond
+	// backlogSteepGrowthChunksPerSec was raised from 40 to 80: live captures showed
+	// a normal fill/drain sawtooth oscillating at ~45-56 chunks/sec (delta ~12-14
+	// chunks per 250ms sample), which is well below genuine runaway spikes (~150-200+
+	// chunks/sec) but was still tripping the old 40/s threshold every other sample.
+	const backlogSteepGrowthChunksPerSec = 80.0
+	// backlogSteepGrowthMinBacklogChunks requires the backlog to already be
+	// meaningfully large before a fast rate counts as an emergency, so a rate
+	// spike on a near-empty buffer doesn't trigger emergency mode.
+	const backlogSteepGrowthMinBacklogChunks = 20
+	// backlogSteepGrowthMinConsecutiveWindows requires the growth condition to
+	// hold across back-to-back samples. This is the main defense against the
+	// sawtooth oscillation, which alternates growth/shrink every sample and so
+	// never satisfies two consecutive qualifying windows.
+	const backlogSteepGrowthMinConsecutiveWindows = 2
+	// backlogGrowthSampleInterval is the minimum time between backlog growth
+	// samples. Recomputing the rate every 5ms ticker tick makes it noise-prone:
+	// a single-chunk fluctuation over 5ms already looks like ~200 chunks/sec.
+	// Sampling on a coarser interval requires growth to be sustained, not just
+	// a momentary blip, before it's treated as an emergency.
+	const backlogGrowthSampleInterval = 250 * time.Millisecond
+	const emergencyHardResyncChunkDivisor = 3
+	// adaptiveMinUnderflowRate guards against reacting to a single stray
+	// underflow: only treat a window as "having a problem" if underflows
+	// make up a meaningful share of chunks received in that window.
+	const adaptiveMinUnderflowRate = 0.02 // 2%
+
+	// adaptiveQuietAfterSoftResync suppresses adaptive target changes for a
+	// short period after a soft resync nudge, so the adaptive controller
+	// doesn't mistake a soft-resync-induced dip for a real network problem.
+	const adaptiveQuietAfterSoftResync = 6000 * time.Millisecond
+
+	// softResyncMaxStepLarge/ProportionalCeiling let the step scale up for
+	// big errors instead of clamping every error above ~170ms to the same
+	// tiny step.
+	const softResyncMaxStepLarge = 60 * time.Millisecond
+	const softResyncProportionalCeiling = 300 * time.Millisecond
+
+	// softResyncQuietAfterAdaptive suppresses soft resync nudges right after
+	// the adaptive controller moves the target, so the buffer gets a chance
+	// to settle against the new target before we nudge playout timing again.
+	const softResyncQuietAfterAdaptive = 4000 * time.Millisecond
 	const softResyncBand = 160 * time.Millisecond
+	const recoveringEnterBand = 240 * time.Millisecond
+	const recoveringExitBand = 120 * time.Millisecond
 	const softResyncMinStep = 8 * time.Millisecond
 	const softResyncMaxStep = 12 * time.Millisecond
 	const softResyncGain = 0.07
@@ -1790,6 +1858,8 @@ func (s *peerControlServer) receiveAudioFromLeader(ctx context.Context, target s
 				return err
 			}
 
+			emergency := false
+
 			if playoutStarted && initialized {
 				queueDelay := currentQueueDelay()
 				delayErrorRaw := queueDelay - playoutDelay
@@ -1798,12 +1868,78 @@ func (s *peerControlServer) receiveAudioFromLeader(ctx context.Context, target s
 				chunkBacklog := len(pending)
 				inWarmup := !playoutStartedAt.IsZero() && now.Sub(playoutStartedAt) < resyncWarmup
 
+				isStalled := !lastChunkAt.IsZero() && now.Sub(lastChunkAt) >= emergencyStallThreshold
+				isSevereDelay := delayErrorRaw >= emergencyQueueDelayThreshold
+
+				if prevBacklogSampleAt.IsZero() || now.Sub(prevBacklogSampleAt) >= backlogGrowthSampleInterval {
+					backlogGrowthRate := 0.0
+					prevBacklogSampleLocal := prevBacklogSample
+					backlogDelta := 0
+					sampleDt := time.Duration(0)
+					if !prevBacklogSampleAt.IsZero() {
+						sampleDt = now.Sub(prevBacklogSampleAt)
+						if sampleDt > 0 {
+							backlogDelta = chunkBacklog - prevBacklogSample
+							backlogGrowthRate = float64(backlogDelta) / sampleDt.Seconds()
+						}
+					}
+					prevBacklogSample = chunkBacklog
+					prevBacklogSampleAt = now
+
+					candidateSteepBacklogGrowth := backlogGrowthRate > backlogSteepGrowthChunksPerSec && chunkBacklog >= backlogSteepGrowthMinBacklogChunks
+					if candidateSteepBacklogGrowth {
+						steepBacklogGrowthWindows++
+					} else {
+						steepBacklogGrowthWindows = 0
+					}
+					steepBacklogGrowth = steepBacklogGrowthWindows >= backlogSteepGrowthMinConsecutiveWindows
+					if candidateSteepBacklogGrowth || steepBacklogGrowth {
+						logDebugf("gRPC stream: backlog growth check session=%q target=%s prev=%d current=%d delta=%d dt_ms=%.1f rate=%.2f/s threshold=%.1f/s candidate=%v windows=%d steep=%v delay_error=%s", req.SessionId, target, prevBacklogSampleLocal, chunkBacklog, backlogDelta, sampleDt.Seconds()*1000, backlogGrowthRate, backlogSteepGrowthChunksPerSec, candidateSteepBacklogGrowth, steepBacklogGrowthWindows, steepBacklogGrowth, delayErrorRaw)
+					}
+				}
+
+				emergency = isStalled || isSevereDelay || steepBacklogGrowth
+
+				newMode := "normal"
+				if emergency {
+					newMode = "emergency"
+				} else {
+					recoveringBand := recoveringEnterBand
+					if controllerMode == "recovering" {
+						recoveringBand = recoveringExitBand
+					}
+					if chunkBacklog > 0 && absoluteDuration(delayErrorEWMA) > recoveringBand {
+						newMode = "recovering"
+					}
+				}
+				if newMode != controllerMode {
+					if newMode == "emergency" || controllerMode == "emergency" {
+						logInfof("gRPC stream: controller mode changed session=%q target=%s from=%s to=%s delay_error=%s backlog_chunks=%d stalled=%v severe_delay=%v steep_growth=%v", req.SessionId, target, controllerMode, newMode, delayErrorRaw, chunkBacklog, isStalled, isSevereDelay, steepBacklogGrowth)
+					}
+					controllerMode = newMode
+				}
+
 				hardByDelay := delayErrorRaw > hardResyncDelayThreshold
 				hardByChunks := chunkBacklog >= hardResyncChunkThreshold
+				if steepBacklogGrowth {
+					// A steep backlog slope means the normal absolute thresholds will
+					// arrive too late; react earlier once both signals are already trending badly.
+					if delayErrorRaw > emergencyQueueDelayThreshold {
+						hardByDelay = true
+					}
+					if chunkBacklog >= hardResyncChunkThreshold/emergencyHardResyncChunkDivisor {
+						hardByChunks = true
+					}
+				}
+				softResyncQuiet := !lastAdaptiveControlAt.IsZero() && now.Sub(lastAdaptiveControlAt) < softResyncQuietAfterAdaptive && !emergency
 
 				if !inWarmup && (hardByDelay && hardByChunks) && hardResyncAllowed(now) {
 					hardResync(now, fmt.Sprintf("delay_error=%s threshold=%s backlog_chunks=%d chunk_threshold=%d", delayErrorRaw, hardResyncDelayThreshold, chunkBacklog, hardResyncChunkThreshold))
-				} else if !inWarmup && now.After(hardResyncWindowUntil) && absoluteDuration(delayErrorEWMA) > softResyncBand {
+				} else if softResyncEnabled && softResyncQuiet {
+					logDebugf("gRPC stream: soft resync suppressed (quiet after adaptive jitter) session=%q target=%s delay_error=%s ewma_delay_error=%s backlog_chunks=%d", req.SessionId, target, delayErrorRaw, delayErrorEWMA, chunkBacklog)
+					// Adaptive just moved the target; let the buffer settle against it
+					// before nudging playout timing again.
+				} else if softResyncEnabled && !inWarmup && now.After(hardResyncWindowUntil) && absoluteDuration(delayErrorEWMA) > softResyncBand {
 					starving := delayErrorEWMA < 0 && chunkBacklog < minSoftResyncBufferedChunks
 					if !starving && (lastSoftResyncAt.IsZero() || now.Sub(lastSoftResyncAt) >= softResyncCooldown) {
 						sign := 1
@@ -1816,46 +1952,100 @@ func (s *peerControlServer) receiveAudioFromLeader(ctx context.Context, target s
 							lastSoftResyncSign = sign
 							softResyncSignWindows = 1
 						}
-						if softResyncSignWindows < softResyncConsecutiveWindows {
-							continue
-						}
 
-						magnitude := time.Duration(float64(absoluteDuration(delayErrorEWMA)) * softResyncGain)
-						if magnitude < softResyncMinStep {
-							magnitude = softResyncMinStep
+						if softResyncSignWindows >= softResyncConsecutiveWindows {
+							errMag := absoluteDuration(delayErrorEWMA)
+							var magnitude time.Duration
+							if errMag <= softResyncProportionalCeiling {
+								magnitude = time.Duration(float64(errMag) * softResyncGain)
+								if magnitude < softResyncMinStep {
+									magnitude = softResyncMinStep
+								}
+								if magnitude > softResyncMaxStep {
+									magnitude = softResyncMaxStep
+								}
+							} else {
+								// Scale further for errors beyond the normal band so a
+								// large deviation corrects faster than a small one.
+								magnitude = time.Duration(float64(errMag) * softResyncGain)
+								if magnitude < softResyncMaxStep {
+									magnitude = softResyncMaxStep
+								}
+								if magnitude > softResyncMaxStepLarge {
+									magnitude = softResyncMaxStepLarge
+								}
+							}
+							step := -magnitude
+							if delayErrorEWMA < 0 {
+								step = magnitude
+							}
+							nextPlayoutAt = nextPlayoutAt.Add(step)
+							lastSoftResyncAt = now
+							lastSoftControlAt = now
+
+							// Soft nudges can temporarily perturb underflow/catchup counters.
+							// Reset adaptive window baselines on meaningful nudges so the
+							// next adaptive decision reflects post-nudge behavior.
+							if absoluteDuration(step) >= adaptiveResetOnSoftNudgeMinStep {
+								if lastAdaptiveResetAt.IsZero() || now.Sub(lastAdaptiveResetAt) >= adaptiveResetOnSoftNudgeMinInterval {
+									lastAdaptiveReceived = metrics.ReceivedChunks
+									lastAdaptiveLate = metrics.LateDropped
+									lastAdaptiveUnderflows = metrics.Underflows
+									lastAdaptiveCatchup = metrics.CatchupResyncs
+									issueAdaptiveWindows = 0
+									stableAdaptiveWindows = 0
+									lastAdaptiveResetAt = now
+									logDebugf("gRPC stream: adaptive window reset after soft nudge session=%q target=%s step=%s threshold=%s min_interval=%s", req.SessionId, target, step, adaptiveResetOnSoftNudgeMinStep, adaptiveResetOnSoftNudgeMinInterval)
+								} else {
+									logDebugf("gRPC stream: adaptive window reset suppressed (min interval) session=%q target=%s step=%s since_last=%s min_interval=%s", req.SessionId, target, step, now.Sub(lastAdaptiveResetAt), adaptiveResetOnSoftNudgeMinInterval)
+								}
+							}
+
+							playableChunks := contiguousBufferedChunks()
+							playableDelay := time.Duration(playableChunks) * chunkDur
+							playableError := playableDelay - playoutDelay
+							logDebugf("gRPC stream: soft resync nudge session=%q target=%s step=%s queue_delay_total=%s queue_delay_playable=%s target_delay=%s delay_error_total=%s delay_error_ewma=%s delay_error_playable=%s", req.SessionId, target, step, queueDelay, playableDelay, playoutDelay, delayErrorRaw, delayErrorEWMA, playableError)
 						}
-						if magnitude > softResyncMaxStep {
-							magnitude = softResyncMaxStep
-						}
-						step := -magnitude
-						if delayErrorEWMA < 0 {
-							step = magnitude
-						}
-						nextPlayoutAt = nextPlayoutAt.Add(step)
-						lastSoftResyncAt = now
-						playableChunks := contiguousBufferedChunks()
-						playableDelay := time.Duration(playableChunks) * chunkDur
-						playableError := playableDelay - playoutDelay
-						logDebugf("gRPC stream: soft resync nudge session=%q target=%s step=%s queue_delay_total=%s queue_delay_playable=%s target_delay=%s delay_error_total=%s delay_error_ewma=%s delay_error_playable=%s", req.SessionId, target, step, queueDelay, playableDelay, playoutDelay, delayErrorRaw, delayErrorEWMA, playableError)
 					}
-				} else {
+				} else if softResyncEnabled {
 					softResyncSignWindows = 0
 					lastSoftResyncSign = 0
 				}
 			}
 
-			if adaptiveEnabled && playoutStarted && now.Sub(lastAdaptiveTuneAt) >= adaptiveTuneInterval {
+			tuneInterval := adaptiveTuneInterval
+			if emergency {
+				tuneInterval = adaptiveEmergencyTuneInterval
+			}
+			if adaptiveEnabled && playoutStarted && now.Sub(lastAdaptiveTuneAt) >= tuneInterval {
 				windowReceived := metrics.ReceivedChunks - lastAdaptiveReceived
 				windowLate := metrics.LateDropped - lastAdaptiveLate
 				windowUnderflows := metrics.Underflows - lastAdaptiveUnderflows
 				windowCatchup := metrics.CatchupResyncs - lastAdaptiveCatchup
 
+				// A handful of underflows out of hundreds of chunks is normal noise,
+				// not evidence the buffer is too small. React to underflow *rate*.
+				underflowRate := 0.0
+				if windowReceived > 0 {
+					underflowRate = float64(windowUnderflows) / float64(windowReceived)
+				}
+				hasIssue := (windowReceived > 0 && underflowRate > adaptiveMinUnderflowRate) || windowLate > 0 || windowCatchup > 0
+
+				adaptiveQuiet := !lastSoftControlAt.IsZero() && now.Sub(lastSoftControlAt) < adaptiveQuietAfterSoftResync && !emergency
+
+				// During an emergency, don't wait for two consecutive bad windows;
+				// a single severe window is enough to justify raising the target now.
+				requiredIssueWindows := adaptiveIncreaseIssueWindows
+				if emergency {
+					requiredIssueWindows = 1
+				}
+
 				newDelay := playoutDelay
 				reason := ""
-				if windowUnderflows > 0 || windowLate > 0 || windowCatchup > 0 {
+				if hasIssue {
 					stableAdaptiveWindows = 0
 					issueAdaptiveWindows++
-					if issueAdaptiveWindows >= adaptiveIncreaseIssueWindows {
+					if issueAdaptiveWindows >= requiredIssueWindows {
 						candidate := playoutDelay + adaptiveStep
 						if candidate > adaptiveMax {
 							candidate = adaptiveMax
@@ -1885,11 +2075,16 @@ func (s *peerControlServer) receiveAudioFromLeader(ctx context.Context, target s
 					issueAdaptiveWindows = 0
 				}
 
+				if newDelay != playoutDelay && adaptiveQuiet {
+					logDebugf("gRPC stream: adaptive jitter change suppressed (quiet after soft resync) session=%q target=%s candidate=%s current=%s reason=%s", req.SessionId, target, newDelay, playoutDelay, reason)
+					newDelay = playoutDelay
+				}
 				if newDelay != playoutDelay {
 					delta := newDelay - playoutDelay
 					playoutDelay = newDelay
 					metrics.TargetJitterDelay = playoutDelay
 					nextPlayoutAt = nextPlayoutAt.Add(delta)
+					lastAdaptiveControlAt = now
 					logDebugf("gRPC stream: adaptive jitter adjusted session=%q target=%s new_delay=%s min=%s max=%s step=%s reason=%s", req.SessionId, target, playoutDelay, adaptiveMin, adaptiveMax, adaptiveStep, reason)
 				}
 
