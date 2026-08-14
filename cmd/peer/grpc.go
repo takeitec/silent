@@ -57,12 +57,13 @@ type peerControlServer struct {
 }
 
 const (
-	chunkLogModeOff       = "off"
-	chunkLogModeMilestone = "milestone"
-	chunkLogModeAll       = "all"
-	leaderSharedRingSize  = 256
-	leaderSlowDropWindow  = 5 * time.Second
-	leaderSlowDropLimit   = 200
+	chunkLogModeOff         = "off"
+	chunkLogModeMilestone   = "milestone"
+	chunkLogModeAll         = "all"
+	leaderSharedRingSize    = 256
+	leaderSlowDropWindow    = 5 * time.Second
+	leaderSlowDropLimit     = 200
+	leaderSlowRecoveryGrace = 5 * time.Second
 )
 
 func normaliseChunkLogMode(mode string) string {
@@ -752,15 +753,17 @@ func streamTarget(ctx context.Context) string {
 }
 
 type leaderSharedSubscriber struct {
-	id              string
-	target          string
-	nextSeq         int64
-	done            chan struct{}
-	dropWindowStart time.Time
-	dropWindowCount int
-	errMu           stdsync.Mutex
-	err             error
-	closeOnce       stdsync.Once
+	id                 string
+	target             string
+	nextSeq            int64
+	done               chan struct{}
+	dropWindowStart    time.Time
+	dropWindowCount    int
+	recoveryGraceUntil time.Time
+	recoveryGraceUsed  bool
+	errMu              stdsync.Mutex
+	err                error
+	closeOnce          stdsync.Once
 }
 
 func (sub *leaderSharedSubscriber) fail(err error) {
@@ -1166,6 +1169,22 @@ func (s *peerControlServer) streamAudioFromLeaderShared(req *control.StreamPlayb
 			if sub.nextSeq < ls.startSeq {
 				dropped := int(ls.startSeq - sub.nextSeq)
 				now := time.Now()
+				if !sub.recoveryGraceUsed {
+					sub.recoveryGraceUsed = true
+					sub.recoveryGraceUntil = now.Add(leaderSlowRecoveryGrace)
+					sub.dropWindowStart = now
+					sub.dropWindowCount = 0
+					ls.metrics.SubscriberSkips += int64(dropped)
+					sub.nextSeq = ls.startSeq
+					logWarnf("gRPC stream: leader subscriber recovery grace session=%q target=%s skipped=%d grace=%s", ls.sessionID, sub.target, dropped, leaderSlowRecoveryGrace)
+					// Re-enter the loop so the current ring head follows the normal send, close, or wait path.
+					continue
+				}
+				if now.Before(sub.recoveryGraceUntil) {
+					sub.nextSeq = ls.startSeq
+					// Re-check the current ring head without charging this recovery window to the drop budget.
+					continue
+				}
 				if sub.dropWindowStart.IsZero() || now.Sub(sub.dropWindowStart) >= leaderSlowDropWindow {
 					sub.dropWindowStart = now
 					sub.dropWindowCount = 0
@@ -1583,6 +1602,8 @@ func (s *peerControlServer) receiveAudioFromLeader(ctx context.Context, target s
 	steepBacklogGrowth := false
 	steepBacklogGrowthWindows := 0
 	emergencyStartedAt := time.Time{}
+	emergencyHealthySampleAt := time.Time{}
+	emergencyHealthyWindows := 0
 
 	const maxPlayoutStepsPerDrain = 8
 	const receiveStallLogInterval = 2 * time.Second
@@ -1596,6 +1617,9 @@ func (s *peerControlServer) receiveAudioFromLeader(ctx context.Context, target s
 	// adaptiveTuneInterval while the controller is in emergency mode, so it can
 	// react to a stall or backlog blowup within a second or two instead of five.
 	const adaptiveEmergencyTuneInterval = 1 * time.Second
+	const emergencyMinimumDwell = 3 * time.Second
+	const emergencyHealthySampleInterval = 250 * time.Millisecond
+	const emergencyHealthyWindowsRequired = 3
 	// emergencyStallThreshold/emergencyQueueDelayThreshold/backlogSteepGrowthChunksPerSec
 	// define "emergency mode": conditions severe enough that the normal mutual
 	// quiet-gating between soft resync and adaptive jitter should be bypassed so
@@ -1943,7 +1967,27 @@ func (s *peerControlServer) receiveAudioFromLeader(ctx context.Context, target s
 					}
 				}
 
-				emergency = isStalled || isSevereDelay || steepBacklogGrowth
+				rawEmergency := isStalled || isSevereDelay || steepBacklogGrowth
+				emergency = rawEmergency
+				if controllerMode == "emergency" && !emergencyStartedAt.IsZero() {
+					if now.Sub(emergencyStartedAt) < emergencyMinimumDwell {
+						emergency = true
+						emergencyHealthyWindows = 0
+					} else if !rawEmergency && absoluteDuration(delayErrorEWMA) <= recoveringExitBand && contiguousBufferedChunks() > 0 {
+						if emergencyHealthySampleAt.IsZero() || now.Sub(emergencyHealthySampleAt) >= emergencyHealthySampleInterval {
+							emergencyHealthySampleAt = now
+							emergencyHealthyWindows++
+						}
+						emergency = emergencyHealthyWindows < emergencyHealthyWindowsRequired
+					} else {
+						emergencyHealthySampleAt = time.Time{}
+						emergencyHealthyWindows = 0
+						emergency = true
+					}
+				} else if rawEmergency {
+					emergencyHealthySampleAt = time.Time{}
+					emergencyHealthyWindows = 0
+				}
 
 				newMode := "normal"
 				if emergency {
@@ -1963,6 +2007,8 @@ func (s *peerControlServer) receiveAudioFromLeader(ctx context.Context, target s
 					}
 					if newMode == "emergency" {
 						emergencyStartedAt = now
+						emergencyHealthySampleAt = time.Time{}
+						emergencyHealthyWindows = 0
 						logInfof("gRPC stream: emergency started session=%q target=%s reason_stalled=%v reason_severe_delay=%v reason_steep_growth=%v delay_error=%s backlog_chunks=%d", req.SessionId, target, isStalled, isSevereDelay, steepBacklogGrowth, delayErrorRaw, chunkBacklog)
 					} else if controllerMode == "emergency" && !emergencyStartedAt.IsZero() {
 						logInfof("gRPC stream: emergency ended session=%q target=%s duration=%s next_mode=%s delay_error=%s backlog_chunks=%d", req.SessionId, target, now.Sub(emergencyStartedAt), newMode, delayErrorRaw, chunkBacklog)
