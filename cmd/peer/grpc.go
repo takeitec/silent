@@ -1752,6 +1752,8 @@ func (s *peerControlServer) receiveAudioFromLeader(ctx context.Context, target s
 	// the adaptive controller moves the target, so the buffer gets a chance
 	// to settle against the new target before we nudge playout timing again.
 	const softResyncQuietAfterAdaptive = 4000 * time.Millisecond
+	const emergencySoftResyncQuietAfterAdaptive = 1000 * time.Millisecond
+	const emergencyAdaptiveQuietAfterSoftResync = 1000 * time.Millisecond
 	const softResyncBand = 160 * time.Millisecond
 	const recoveringEnterBand = 240 * time.Millisecond
 	const recoveringExitBand = 120 * time.Millisecond
@@ -2132,7 +2134,11 @@ func (s *peerControlServer) receiveAudioFromLeader(ctx context.Context, target s
 						hardByChunks = true
 					}
 				}
-				softResyncQuiet := !lastAdaptiveControlAt.IsZero() && now.Sub(lastAdaptiveControlAt) < softResyncQuietAfterAdaptive && !emergency
+				softResyncQuietAfterAdaptiveWindow := softResyncQuietAfterAdaptive
+				if emergency {
+					softResyncQuietAfterAdaptiveWindow = emergencySoftResyncQuietAfterAdaptive
+				}
+				softResyncQuiet := !lastAdaptiveControlAt.IsZero() && now.Sub(lastAdaptiveControlAt) < softResyncQuietAfterAdaptiveWindow
 
 				if !inWarmup && (hardByDelay && hardByChunks) && hardResyncAllowed(now) {
 					hardResync(now, fmt.Sprintf("delay_error=%s threshold=%s backlog_chunks=%d chunk_threshold=%d", delayErrorRaw, hardResyncDelayThreshold, chunkBacklog, hardResyncChunkThreshold))
@@ -2306,7 +2312,11 @@ func (s *peerControlServer) receiveAudioFromLeader(ctx context.Context, target s
 				}
 				hasIssue := (windowReceived > 0 && underflowRate > adaptiveMinUnderflowRate) || windowLate > 0 || windowCatchup > 0
 
-				adaptiveQuiet := !lastSoftControlAt.IsZero() && now.Sub(lastSoftControlAt) < adaptiveQuietAfterSoftResync && !emergency
+				adaptiveQuietAfterSoftResyncWindow := adaptiveQuietAfterSoftResync
+				if emergency {
+					adaptiveQuietAfterSoftResyncWindow = emergencyAdaptiveQuietAfterSoftResync
+				}
+				adaptiveQuiet := !lastSoftControlAt.IsZero() && now.Sub(lastSoftControlAt) < adaptiveQuietAfterSoftResyncWindow
 
 				// During an emergency, don't wait for two consecutive bad windows;
 				// a single severe window is enough to justify raising the target now.
