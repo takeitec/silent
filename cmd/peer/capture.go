@@ -9,6 +9,8 @@ import (
 	"slices"
 	"sort"
 	"strings"
+	"sync"
+	"time"
 
 	"silent/internal/control"
 )
@@ -60,6 +62,8 @@ func startLiveCaptureSource(device string) (io.ReadCloser, func() error, error) 
 	case "linux":
 		args = append(args,
 			"-f", "pulse",
+			"-probesize", "32",
+			"-analyzeduration", "0",
 			"-i", dev,
 		)
 	case "windows":
@@ -69,6 +73,9 @@ func startLiveCaptureSource(device string) (io.ReadCloser, func() error, error) 
 
 		args = append(args,
 			"-f", "dshow",
+			"-audio_buffer_size", "50",
+			"-probesize", "32",
+			"-analyzeduration", "0",
 			"-i", "audio="+dev,
 		)
 	default:
@@ -124,6 +131,14 @@ func startFFmpegPipe(args []string, sourceName string) (io.ReadCloser, func() er
 		_ = stdout.Close()
 		return nil, nil, fmt.Errorf("start ffmpeg source %q: %w", sourceName, err)
 	}
+	startedAt := time.Now()
+	logInfof("capture: ffmpeg started source=%q at=%s", sourceName, startedAt.Format(time.RFC3339Nano))
+	stdout = &captureReadLogger{
+		ReadCloser: stdout,
+		onFirstRead: func(readAt time.Time, bytes int) {
+			logInfof("capture: first PCM read source=%q at=%s bytes=%d startup_latency=%s", sourceName, readAt.Format(time.RFC3339Nano), bytes, readAt.Sub(startedAt))
+		},
+	}
 
 	closeAndWait := func() error {
 		_ = stdout.Close()
@@ -138,6 +153,23 @@ func startFFmpegPipe(args []string, sourceName string) (io.ReadCloser, func() er
 	}
 
 	return stdout, closeAndWait, nil
+}
+
+type captureReadLogger struct {
+	io.ReadCloser
+	firstReadOnce sync.Once
+	onFirstRead   func(time.Time, int)
+}
+
+func (r *captureReadLogger) Read(p []byte) (int, error) {
+	n, err := r.ReadCloser.Read(p)
+	if n > 0 && r.onFirstRead != nil {
+		readAt := time.Now()
+		r.firstReadOnce.Do(func() {
+			r.onFirstRead(readAt, n)
+		})
+	}
+	return n, err
 }
 
 func defaultStreamFormat() streamFormat {
