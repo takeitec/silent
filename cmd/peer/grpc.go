@@ -1169,6 +1169,16 @@ func (s *peerControlServer) streamAudioFromLeaderShared(req *control.StreamPlayb
 			if sub.nextSeq < ls.startSeq {
 				dropped := int(ls.startSeq - sub.nextSeq)
 				now := time.Now()
+				nextSequence := ls.startSeq
+				sendDiscontinuity := func() error {
+					marker := &control.AudioChunk{
+						SessionId:             ls.sessionID,
+						Sequence:              nextSequence,
+						SequenceDiscontinuity: true,
+						NextSequence:          nextSequence,
+					}
+					return stream.Send(marker)
+				}
 				if !sub.recoveryGraceUsed {
 					sub.recoveryGraceUsed = true
 					sub.recoveryGraceUntil = now.Add(leaderSlowRecoveryGrace)
@@ -1177,12 +1187,22 @@ func (s *peerControlServer) streamAudioFromLeaderShared(req *control.StreamPlayb
 					ls.metrics.SubscriberSkips += int64(dropped)
 					sub.nextSeq = ls.startSeq
 					logWarnf("gRPC stream: leader subscriber recovery grace session=%q target=%s skipped=%d grace=%s", ls.sessionID, sub.target, dropped, leaderSlowRecoveryGrace)
-					// Re-enter the loop so the current ring head follows the normal send, close, or wait path.
+					ls.mu.Unlock()
+					if err := sendDiscontinuity(); err != nil {
+						sub.fail(err)
+						return err
+					}
+					ls.mu.Lock()
 					continue
 				}
 				if now.Before(sub.recoveryGraceUntil) {
 					sub.nextSeq = ls.startSeq
-					// Re-check the current ring head without charging this recovery window to the drop budget.
+					ls.mu.Unlock()
+					if err := sendDiscontinuity(); err != nil {
+						sub.fail(err)
+						return err
+					}
+					ls.mu.Lock()
 					continue
 				}
 				if sub.dropWindowStart.IsZero() || now.Sub(sub.dropWindowStart) >= leaderSlowDropWindow {
@@ -1202,6 +1222,12 @@ func (s *peerControlServer) streamAudioFromLeaderShared(req *control.StreamPlayb
 					s.unsubscribeLeaderSharedStream(ls, sub, "slow-consumer")
 					return err
 				}
+				ls.mu.Unlock()
+				if err := sendDiscontinuity(); err != nil {
+					sub.fail(err)
+					return err
+				}
+				ls.mu.Lock()
 			}
 
 			available := int64(len(ls.chunks))
@@ -1412,11 +1438,13 @@ func (s *peerControlServer) receiveAudioFromLeader(ctx context.Context, target s
 	chunksReceived := 0
 	firstChunkLogged := false
 	metrics := newStreamHealthMetrics(playoutDelay)
+	sinkWriteWindow := newDelaySummary()
 
 	liveSink := io.WriteCloser(nil)
 	closeLiveSink := func() error { return nil }
 	liveLogPath := ""
 	lastLiveErrorLogPath := ""
+	lastSlowSinkWriteLogAt := time.Time{}
 	restartAttempted := false
 	startLiveSink := func(reason string) bool {
 		sink, closeFn, logPath, err := startStreamingPlaybackWithFormatAndLog(streamFormat, req.SessionId)
@@ -1509,8 +1537,16 @@ func (s *peerControlServer) receiveAudioFromLeader(ctx context.Context, target s
 
 		if liveSink != nil {
 			sinkWriteAt := time.Now()
-			if _, err := liveSink.Write(payload); err != nil {
-				disableLiveSink(fmt.Sprintf("live write (%s) seq=%d", source, seq), err)
+			_, writeErr := liveSink.Write(payload)
+			writeDuration := time.Since(sinkWriteAt)
+			metrics.ObserveSinkWrite(writeDuration)
+			sinkWriteWindow.Observe(writeDuration)
+			if writeDuration >= 100*time.Millisecond && (lastSlowSinkWriteLogAt.IsZero() || writeDuration >= 2*time.Second || sinkWriteAt.Sub(lastSlowSinkWriteLogAt) >= 2*time.Second) {
+				lastSlowSinkWriteLogAt = sinkWriteAt
+				logWarnf("gRPC stream: slow live sink write session=%q seq=%d source=%s duration=%s payload_bytes=%d", req.SessionId, seq, source, writeDuration, len(payload))
+			}
+			if writeErr != nil {
+				disableLiveSink(fmt.Sprintf("live write (%s) seq=%d", source, seq), writeErr)
 				attemptRestart(fmt.Sprintf("live write (%s) seq=%d", source, seq))
 				if liveSink == nil {
 					if err := failDueToLivePlayback(fmt.Sprintf("live write (%s) seq=%d", source, seq)); err != nil {
@@ -1804,7 +1840,7 @@ func (s *peerControlServer) receiveAudioFromLeader(ctx context.Context, target s
 		if !driftCorrectionActiveSince.IsZero() {
 			driftCorrectionActiveTotalSnapshot += time.Since(driftCorrectionActiveSince)
 		}
-		logDebugf("gRPC stream: health stage=%s session=%q target=%s received=%d played=%d late_dropped=%d duplicate_dropped=%d underflows=%d gap_silence=%d catchup_resyncs=%d hard_resyncs=%d buffered_total=%d buffered_playable=%d expected_seq=%d queue_delay_total=%s queue_delay_playable=%s delay_error_total=%s delay_error_playable=%s ewma_delay_error=%s playout_interval=%s drift_correction_peak=%s drift_correction_active_total=%s drift_correction_episodes=%d one_way=%s produced_to_recv=%s recv_to_scheduled=%s scheduled_to_sink_write=%s produced_to_scheduled=%s produced_to_sink_write=%s send_block=%s",
+		logDebugf("gRPC stream: health stage=%s session=%q target=%s received=%d played=%d late_dropped=%d duplicate_dropped=%d underflows=%d gap_silence=%d catchup_resyncs=%d hard_resyncs=%d buffered_total=%d buffered_playable=%d expected_seq=%d queue_delay_total=%s queue_delay_playable=%s delay_error_total=%s delay_error_playable=%s ewma_delay_error=%s playout_interval=%s drift_correction_peak=%s drift_correction_active_total=%s drift_correction_episodes=%d one_way=%s produced_to_recv=%s recv_to_scheduled=%s scheduled_to_sink_write=%s produced_to_scheduled=%s produced_to_sink_write=%s sink_write=%s sink_write_window=%s send_block=%s",
 			stage,
 			req.SessionId,
 			target,
@@ -1834,8 +1870,11 @@ func (s *peerControlServer) receiveAudioFromLeader(ctx context.Context, target s
 			metrics.ScheduledToWriteSummary(),
 			metrics.ProducedToScheduledSummary(),
 			metrics.ProducedToWriteSummary(),
+			metrics.SinkWriteSummary(),
+			sinkWriteWindow.Summary(),
 			metrics.SendBlockSummary(),
 		)
+		sinkWriteWindow = newDelaySummary()
 	}
 
 	tickerPeriod := chunkDur / 4
@@ -2319,6 +2358,20 @@ func (s *peerControlServer) receiveAudioFromLeader(ctx context.Context, target s
 
 			chunk := env.chunk
 			if chunk == nil {
+				continue
+			}
+
+			if chunk.GetSequenceDiscontinuity() {
+				nextSequence := chunk.GetNextSequence()
+				for seq := range pending {
+					if seq < nextSequence {
+						delete(pending, seq)
+					}
+				}
+				expectedSeq = nextSequence
+				initialized = true
+				latestSeqReceived = nextSequence - 1
+				logWarnf("gRPC stream: sequence discontinuity target=%s session=%q expected_seq=%d next_sequence=%d pending=%d", target, req.SessionId, expectedSeq, nextSequence, len(pending))
 				continue
 			}
 

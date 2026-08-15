@@ -120,6 +120,7 @@ type streamHealthMetrics struct {
 	scheduledToWrite  delaySummary
 	producedToSched   delaySummary
 	producedToWrite   delaySummary
+	sinkWrite         delaySummary
 	sendBlock         delaySummary
 }
 
@@ -132,6 +133,7 @@ func newStreamHealthMetrics(targetDelay time.Duration) streamHealthMetrics {
 		scheduledToWrite:  newDelaySummary(),
 		producedToSched:   newDelaySummary(),
 		producedToWrite:   newDelaySummary(),
+		sinkWrite:         newDelaySummary(),
 		sendBlock:         newDelaySummary(),
 	}
 }
@@ -183,6 +185,14 @@ func (m *streamHealthMetrics) ObserveProducedToWrite(delay time.Duration) {
 
 func (m streamHealthMetrics) ProducedToWriteSummary() string {
 	return m.producedToWrite.Summary()
+}
+
+func (m *streamHealthMetrics) ObserveSinkWrite(delay time.Duration) {
+	m.sinkWrite.Observe(delay)
+}
+
+func (m streamHealthMetrics) SinkWriteSummary() string {
+	return m.sinkWrite.Summary()
 }
 
 func (m *streamHealthMetrics) ObserveSendBlock(delay time.Duration) {
