@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"net"
 	"silent/internal/models"
 	"silent/internal/peerlist"
@@ -108,5 +109,14 @@ func TestStreamTargetUsesMetadataFallback(t *testing.T) {
 
 	if got := streamTarget(ctx); got != "10.0.0.1:50051" {
 		t.Fatalf("expected metadata address, got %q", got)
+	}
+}
+
+func TestIsSlowSubscriberDisconnect(t *testing.T) {
+	if !isSlowSubscriberDisconnect(errors.New("slow subscriber dropped=200 window=5s")) {
+		t.Fatal("expected slow subscriber error to be rejoinable")
+	}
+	if isSlowSubscriberDisconnect(errors.New("rpc error: code = Unavailable desc = connection reset")) {
+		t.Fatal("did not expect unrelated transport error to be rejoinable")
 	}
 }

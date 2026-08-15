@@ -65,7 +65,13 @@ const (
 	leaderSlowDropLimit     = 200
 	leaderSlowRecoveryGrace = 5 * time.Second
 	sinkWriteQueueCapacity  = 16
+	rejoinInitialBackoff    = 500 * time.Millisecond
+	rejoinMaxBackoff        = 5 * time.Second
 )
+
+func isSlowSubscriberDisconnect(err error) bool {
+	return err != nil && strings.Contains(strings.ToLower(err.Error()), "slow subscriber")
+}
 
 func normaliseChunkLogMode(mode string) string {
 	switch strings.ToLower(strings.TrimSpace(mode)) {
@@ -307,13 +313,37 @@ func (s *peerControlServer) StartStreamPlayback(ctx context.Context, req *contro
 			defer s.clearSessionCancel(sessionID)
 			defer s.finishSession(sessionID)
 			logInfof("gRPC stream: follower starting async receive session=%q target=%s at=%s format=%s rate=%d channels=%d", sessionID, target, time.Now().Format(time.RFC3339Nano), streamFormat.SampleFormat, streamFormat.SampleRate, streamFormat.Channels)
-			if err := s.receiveAudioFromLeader(runCtx, target, streamReq, sharedAt); err != nil {
-				if errors.Is(err, context.Canceled) || status.Code(err) == codes.Canceled {
-					logInfof("gRPC stream: follower stream stopped session=%q", sessionID)
+			backoff := rejoinInitialBackoff
+			for {
+				err := s.receiveAudioFromLeader(runCtx, target, streamReq, sharedAt)
+				if err == nil || !isSlowSubscriberDisconnect(err) {
+					if err != nil {
+						if errors.Is(err, context.Canceled) || status.Code(err) == codes.Canceled {
+							logInfof("gRPC stream: follower stream stopped session=%q", sessionID)
+							return
+						}
+						logWarnf("gRPC stream: follower failed to receive session=%q from leader: %v", sessionID, err)
+					}
 					return
 				}
-				logWarnf("gRPC stream: follower failed to receive session=%q from leader: %v", sessionID, err)
+
+				logWarnf("gRPC stream: follower rejoining after slow-subscriber disconnect session=%q target=%s retry_in=%s: %v", sessionID, target, backoff, err)
+				timer := time.NewTimer(backoff)
+				select {
+				case <-runCtx.Done():
+					if !timer.Stop() {
+						<-timer.C
+					}
+					logInfof("gRPC stream: follower stream stopped during rejoin session=%q", sessionID)
+					return
+				case <-timer.C:
+				}
+				backoff *= 2
+				if backoff > rejoinMaxBackoff {
+					backoff = rejoinMaxBackoff
+				}
 			}
+
 		}()
 
 		return &control.StreamPlaybackResponse{
