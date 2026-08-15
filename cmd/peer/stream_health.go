@@ -104,24 +104,26 @@ func (d delaySummary) Summary() string {
 }
 
 type streamHealthMetrics struct {
-	TargetJitterDelay time.Duration
-	ReceivedChunks    int64
-	PlayedChunks      int64
-	LateDropped       int64
-	DuplicateDropped  int64
-	Underflows        int64
-	GapFillSilence    int64
-	CatchupResyncs    int64
-	HardResyncs       int64
-	MaxBufferedChunks int
-	oneWay            delaySummary
-	producedToRecv    delaySummary
-	recvToScheduled   delaySummary
-	scheduledToWrite  delaySummary
-	producedToSched   delaySummary
-	producedToWrite   delaySummary
-	sinkWrite         delaySummary
-	sendBlock         delaySummary
+	TargetJitterDelay     time.Duration
+	ReceivedChunks        int64
+	PlayoutEnqueuedChunks int64
+	SinkWrittenChunks     int64
+	LateDropped           int64
+	DuplicateDropped      int64
+	Underflows            int64
+	GapFillSilence        int64
+	CatchupResyncs        int64
+	HardResyncs           int64
+	SinkQueueDropped      int64
+	MaxBufferedChunks     int
+	oneWay                delaySummary
+	producedToRecv        delaySummary
+	recvToScheduled       delaySummary
+	scheduledToWrite      delaySummary
+	producedToSched       delaySummary
+	producedToWrite       delaySummary
+	sinkWrite             delaySummary
+	sendBlock             delaySummary
 }
 
 func newStreamHealthMetrics(targetDelay time.Duration) streamHealthMetrics {

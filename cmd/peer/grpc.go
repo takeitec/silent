@@ -64,6 +64,7 @@ const (
 	leaderSlowDropWindow    = 5 * time.Second
 	leaderSlowDropLimit     = 200
 	leaderSlowRecoveryGrace = 5 * time.Second
+	sinkWriteQueueCapacity  = 16
 )
 
 func normaliseChunkLogMode(mode string) string {
@@ -1444,7 +1445,6 @@ func (s *peerControlServer) receiveAudioFromLeader(ctx context.Context, target s
 	closeLiveSink := func() error { return nil }
 	liveLogPath := ""
 	lastLiveErrorLogPath := ""
-	lastSlowSinkWriteLogAt := time.Time{}
 	restartAttempted := false
 	startLiveSink := func(reason string) bool {
 		sink, closeFn, logPath, err := startStreamingPlaybackWithFormatAndLog(streamFormat, req.SessionId)
@@ -1521,48 +1521,97 @@ func (s *peerControlServer) receiveAudioFromLeader(ctx context.Context, target s
 		sentAt     time.Time
 	}
 
-	writeAudio := func(payload []byte, seq int64, source string, scheduledAt time.Time, queued queuedChunk) error {
-		if len(payload) == 0 {
-			return nil
-		}
-
+	sinkCtx, cancelSink := context.WithCancel(ctx)
+	defer cancelSink()
+	sinkWriter := newSinkWriter(sinkCtx, sinkWriteQueueCapacity, func(request sinkWriteRequest) sinkWriteResult {
+		result := sinkWriteResult{request: request}
 		if liveSink == nil && !restartAttempted {
 			attemptRestart("live sink unavailable before playout")
 			if liveSink == nil {
-				if err := failDueToLivePlayback("startup failure"); err != nil {
-					return err
-				}
+				result.err = failDueToLivePlayback("startup failure")
+				return result
 			}
 		}
 
 		if liveSink != nil {
-			sinkWriteAt := time.Now()
-			_, writeErr := liveSink.Write(payload)
-			writeDuration := time.Since(sinkWriteAt)
-			metrics.ObserveSinkWrite(writeDuration)
-			sinkWriteWindow.Observe(writeDuration)
-			if writeDuration >= 100*time.Millisecond && (lastSlowSinkWriteLogAt.IsZero() || writeDuration >= 2*time.Second || sinkWriteAt.Sub(lastSlowSinkWriteLogAt) >= 2*time.Second) {
-				lastSlowSinkWriteLogAt = sinkWriteAt
-				logWarnf("gRPC stream: slow live sink write session=%q seq=%d source=%s duration=%s payload_bytes=%d", req.SessionId, seq, source, writeDuration, len(payload))
-			}
+			result.startedAt = time.Now()
+			_, writeErr := liveSink.Write(request.payload)
+			result.duration = time.Since(result.startedAt)
 			if writeErr != nil {
-				disableLiveSink(fmt.Sprintf("live write (%s) seq=%d", source, seq), writeErr)
-				attemptRestart(fmt.Sprintf("live write (%s) seq=%d", source, seq))
+				trigger := fmt.Sprintf("live write (%s) seq=%d", request.source, request.seq)
+				disableLiveSink(trigger, writeErr)
+				attemptRestart(trigger)
 				if liveSink == nil {
-					if err := failDueToLivePlayback(fmt.Sprintf("live write (%s) seq=%d", source, seq)); err != nil {
-						return err
-					}
-				}
-			} else if !queued.receivedAt.IsZero() && !scheduledAt.IsZero() {
-				metrics.ObserveRecvToScheduled(scheduledAt.Sub(queued.receivedAt))
-				metrics.ObserveScheduledToWrite(sinkWriteAt.Sub(scheduledAt))
-				if !queued.producedAt.IsZero() {
-					metrics.ObserveProducedToScheduled(scheduledAt.Sub(queued.producedAt))
-					metrics.ObserveProducedToWrite(sinkWriteAt.Sub(queued.producedAt))
+					result.err = failDueToLivePlayback(trigger)
 				}
 			}
 		}
+		return result
+	}, func() {
+		if liveSink == nil {
+			return
+		}
+		if err := closeLiveSink(); err != nil {
+			logWarnf("gRPC stream: live playback process ended with error for session=%q: %v", req.SessionId, err)
+		}
+	})
 
+	lastSlowSinkWriteLogAt := time.Time{}
+	lastSinkQueueDropLogAt := time.Time{}
+	sinkResults := sinkWriter.results
+	sinkQueueWait := newDelaySummary()
+	handleSinkResult := func(result sinkWriteResult) error {
+		if !result.request.enqueuedAt.IsZero() && !result.startedAt.IsZero() {
+			sinkQueueWait.Observe(result.startedAt.Sub(result.request.enqueuedAt))
+		}
+		metrics.ObserveSinkWrite(result.duration)
+		sinkWriteWindow.Observe(result.duration)
+		if result.duration >= 100*time.Millisecond && (lastSlowSinkWriteLogAt.IsZero() || result.duration >= 2*time.Second || result.startedAt.Sub(lastSlowSinkWriteLogAt) >= 2*time.Second) {
+			lastSlowSinkWriteLogAt = result.startedAt
+			logWarnf("gRPC stream: slow live sink write session=%q seq=%d source=%s duration=%s payload_bytes=%d", req.SessionId, result.request.seq, result.request.source, result.duration, len(result.request.payload))
+		}
+		if result.err != nil {
+			return result.err
+		}
+		if !result.startedAt.IsZero() {
+			metrics.SinkWrittenChunks++
+		}
+		if !result.request.receivedAt.IsZero() && !result.request.scheduledAt.IsZero() {
+			metrics.ObserveRecvToScheduled(result.request.scheduledAt.Sub(result.request.receivedAt))
+			metrics.ObserveScheduledToWrite(result.startedAt.Sub(result.request.scheduledAt))
+			if !result.request.producedAt.IsZero() {
+				metrics.ObserveProducedToScheduled(result.request.scheduledAt.Sub(result.request.producedAt))
+				metrics.ObserveProducedToWrite(result.startedAt.Sub(result.request.producedAt))
+			}
+		}
+		return nil
+	}
+
+	writeAudio := func(payload []byte, seq int64, source string, scheduledAt time.Time, queued queuedChunk) error {
+		if len(payload) == 0 {
+			return nil
+		}
+		request := sinkWriteRequest{
+			payload:     payload,
+			seq:         seq,
+			source:      source,
+			enqueuedAt:  time.Now(),
+			scheduledAt: scheduledAt,
+			receivedAt:  queued.receivedAt,
+			producedAt:  queued.producedAt,
+		}
+		dropped, accepted := sinkWriter.enqueue(request)
+		if !accepted {
+			return fmt.Errorf("live sink writer stopped")
+		}
+		if dropped != nil {
+			metrics.SinkQueueDropped++
+			now := time.Now()
+			if lastSinkQueueDropLogAt.IsZero() || now.Sub(lastSinkQueueDropLogAt) >= 2*time.Second {
+				lastSinkQueueDropLogAt = now
+				logWarnf("gRPC stream: live sink queue overflow session=%q dropped_seq=%d dropped_source=%s queued_seq=%d capacity=%d dropped_total=%d", req.SessionId, dropped.seq, dropped.source, seq, sinkWriteQueueCapacity, metrics.SinkQueueDropped)
+			}
+		}
 		return nil
 	}
 
@@ -1840,18 +1889,22 @@ func (s *peerControlServer) receiveAudioFromLeader(ctx context.Context, target s
 		if !driftCorrectionActiveSince.IsZero() {
 			driftCorrectionActiveTotalSnapshot += time.Since(driftCorrectionActiveSince)
 		}
-		logDebugf("gRPC stream: health stage=%s session=%q target=%s received=%d played=%d late_dropped=%d duplicate_dropped=%d underflows=%d gap_silence=%d catchup_resyncs=%d hard_resyncs=%d buffered_total=%d buffered_playable=%d expected_seq=%d queue_delay_total=%s queue_delay_playable=%s delay_error_total=%s delay_error_playable=%s ewma_delay_error=%s playout_interval=%s drift_correction_peak=%s drift_correction_active_total=%s drift_correction_episodes=%d one_way=%s produced_to_recv=%s recv_to_scheduled=%s scheduled_to_sink_write=%s produced_to_scheduled=%s produced_to_sink_write=%s sink_write=%s sink_write_window=%s send_block=%s",
+		logDebugf("gRPC stream: health stage=%s session=%q target=%s received=%d playout_enqueued=%d sink_written=%d late_dropped=%d duplicate_dropped=%d underflows=%d gap_silence=%d catchup_resyncs=%d hard_resyncs=%d sink_queue_depth=%d sink_queue_capacity=%d sink_queue_dropped=%d buffered_total=%d buffered_playable=%d expected_seq=%d queue_delay_total=%s queue_delay_playable=%s delay_error_total=%s delay_error_playable=%s ewma_delay_error=%s playout_interval=%s drift_correction_peak=%s drift_correction_active_total=%s drift_correction_episodes=%d one_way=%s produced_to_recv=%s recv_to_scheduled=%s sink_queue_wait=%s scheduled_to_sink_write=%s produced_to_scheduled=%s produced_to_sink_write=%s sink_write=%s sink_write_window=%s send_block=%s",
 			stage,
 			req.SessionId,
 			target,
 			metrics.ReceivedChunks,
-			metrics.PlayedChunks,
+			metrics.PlayoutEnqueuedChunks,
+			metrics.SinkWrittenChunks,
 			metrics.LateDropped,
 			metrics.DuplicateDropped,
 			metrics.Underflows,
 			metrics.GapFillSilence,
 			metrics.CatchupResyncs,
 			metrics.HardResyncs,
+			len(sinkWriter.queue),
+			sinkWriteQueueCapacity,
+			metrics.SinkQueueDropped,
 			bufferedTotal,
 			bufferedPlayable,
 			expectedSeq,
@@ -1867,6 +1920,7 @@ func (s *peerControlServer) receiveAudioFromLeader(ctx context.Context, target s
 			metrics.OneWaySummary(),
 			metrics.ProducedToRecvSummary(),
 			metrics.RecvToScheduledSummary(),
+			sinkQueueWait.Summary(),
 			metrics.ScheduledToWriteSummary(),
 			metrics.ProducedToScheduledSummary(),
 			metrics.ProducedToWriteSummary(),
@@ -1875,6 +1929,7 @@ func (s *peerControlServer) receiveAudioFromLeader(ctx context.Context, target s
 			metrics.SendBlockSummary(),
 		)
 		sinkWriteWindow = newDelaySummary()
+		sinkQueueWait = newDelaySummary()
 	}
 
 	tickerPeriod := chunkDur / 4
@@ -1911,7 +1966,7 @@ func (s *peerControlServer) receiveAudioFromLeader(ctx context.Context, target s
 			if queued, ok := pending[expectedSeq]; ok {
 				delete(pending, expectedSeq)
 				missingSeqHoldCount = 0
-				metrics.PlayedChunks++
+				metrics.PlayoutEnqueuedChunks++
 				if err := writeAudio(queued.data, expectedSeq, "chunk", nextPlayoutAt, queued); err != nil {
 					return err
 				}
@@ -1953,6 +2008,15 @@ func (s *peerControlServer) receiveAudioFromLeader(ctx context.Context, target s
 		}
 
 		select {
+		case result, ok := <-sinkResults:
+			if ok {
+				if err := handleSinkResult(result); err != nil {
+					logHealth("sink-error")
+					return err
+				}
+			} else {
+				sinkResults = nil
+			}
 		case <-ticker.C:
 			now := time.Now()
 			if err := drainReady(now); err != nil {
@@ -2336,9 +2400,6 @@ func (s *peerControlServer) receiveAudioFromLeader(ctx context.Context, target s
 			}
 
 			if env.err != nil {
-				if liveSink != nil {
-					disableLiveSink("stream receive error", env.err)
-				}
 				if errors.Is(env.err, context.Canceled) || status.Code(env.err) == codes.Canceled {
 					logInfof("gRPC stream: receive loop canceled target=%s session=%q chunks_received=%d", target, req.SessionId, chunksReceived)
 					logHealth("canceled")
@@ -2464,14 +2525,6 @@ func (s *peerControlServer) receiveAudioFromLeader(ctx context.Context, target s
 	}
 
 	logHealth("completed")
-
-	if liveSink != nil {
-		go func() {
-			if err := closeLiveSink(); err != nil {
-				logWarnf("gRPC stream: live playback process ended with error for session=%q: %v", req.SessionId, err)
-			}
-		}()
-	}
 
 	logInfof("gRPC stream: leader stream finished target=%s session=%q chunks_received=%d", target, req.SessionId, chunksReceived)
 	return nil
