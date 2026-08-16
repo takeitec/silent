@@ -84,6 +84,7 @@ func cloneStreamPlaybackRequest(req *control.StreamPlaybackRequest) *control.Str
 		SampleRate:    req.GetSampleRate(),
 		Channels:      req.GetChannels(),
 		SampleFormat:  req.GetSampleFormat(),
+		PayloadCodec:  req.GetPayloadCodec(),
 	}
 }
 

@@ -255,6 +255,7 @@ type StreamPlaybackRequest struct {
 	SampleRate    uint32                 `protobuf:"varint,6,opt,name=sample_rate,json=sampleRate,proto3" json:"sample_rate,omitempty"`
 	Channels      uint32                 `protobuf:"varint,7,opt,name=channels,proto3" json:"channels,omitempty"`
 	SampleFormat  string                 `protobuf:"bytes,8,opt,name=sample_format,json=sampleFormat,proto3" json:"sample_format,omitempty"`
+	PayloadCodec  string                 `protobuf:"bytes,9,opt,name=payload_codec,json=payloadCodec,proto3" json:"payload_codec,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -341,6 +342,13 @@ func (x *StreamPlaybackRequest) GetChannels() uint32 {
 func (x *StreamPlaybackRequest) GetSampleFormat() string {
 	if x != nil {
 		return x.SampleFormat
+	}
+	return ""
+}
+
+func (x *StreamPlaybackRequest) GetPayloadCodec() string {
+	if x != nil {
+		return x.PayloadCodec
 	}
 	return ""
 }
@@ -781,7 +789,7 @@ const file_internal_control_control_proto_rawDesc = "" +
 	"audio_path\x18\x02 \x01(\tR\taudioPath\x12&\n" +
 	"\x0fshared_at_nanos\x18\x03 \x01(\x03R\rsharedAtNanos\")\n" +
 	"\vPlaybackAck\x12\x1a\n" +
-	"\baccepted\x18\x01 \x01(\bR\baccepted\"\x90\x02\n" +
+	"\baccepted\x18\x01 \x01(\bR\baccepted\"\xb5\x02\n" +
 	"\x15StreamPlaybackRequest\x12\x1d\n" +
 	"\n" +
 	"session_id\x18\x01 \x01(\tR\tsessionId\x12\x19\n" +
@@ -793,7 +801,8 @@ const file_internal_control_control_proto_rawDesc = "" +
 	"\vsample_rate\x18\x06 \x01(\rR\n" +
 	"sampleRate\x12\x1a\n" +
 	"\bchannels\x18\a \x01(\rR\bchannels\x12#\n" +
-	"\rsample_format\x18\b \x01(\tR\fsampleFormat\"m\n" +
+	"\rsample_format\x18\b \x01(\tR\fsampleFormat\x12#\n" +
+	"\rpayload_codec\x18\t \x01(\tR\fpayloadCodec\"m\n" +
 	"\x16StreamPlaybackResponse\x12\x1a\n" +
 	"\baccepted\x18\x01 \x01(\bR\baccepted\x12\x1d\n" +
 	"\n" +

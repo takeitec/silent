@@ -115,6 +115,10 @@ type streamHealthMetrics struct {
 	CatchupResyncs        int64
 	HardResyncs           int64
 	SinkQueueDropped      int64
+	DecodedChunks         int64
+	DecodeTotal           time.Duration
+	DecodeMax             time.Duration
+	DecodeErrors          int64
 	MaxBufferedChunks     int
 	oneWay                delaySummary
 	producedToRecv        delaySummary
@@ -195,6 +199,21 @@ func (m *streamHealthMetrics) ObserveSinkWrite(delay time.Duration) {
 
 func (m streamHealthMetrics) SinkWriteSummary() string {
 	return m.sinkWrite.Summary()
+}
+
+func (m streamHealthMetrics) DecodeSummary() string {
+	if m.DecodedChunks == 0 {
+		return "samples=0"
+	}
+	return fmt.Sprintf("samples=%d avg=%s max=%s errors=%d", m.DecodedChunks, m.DecodeTotal/time.Duration(m.DecodedChunks), m.DecodeMax, m.DecodeErrors)
+}
+
+func (m *streamHealthMetrics) ObserveDecode(duration time.Duration) {
+	m.DecodedChunks++
+	m.DecodeTotal += duration
+	if duration > m.DecodeMax {
+		m.DecodeMax = duration
+	}
 }
 
 func (m *streamHealthMetrics) ObserveSendBlock(delay time.Duration) {

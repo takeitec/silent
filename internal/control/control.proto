@@ -45,6 +45,7 @@ message StreamPlaybackRequest {
   uint32 sample_rate = 6;
   uint32 channels = 7;
   string sample_format = 8;
+  string payload_codec = 9;
 }
 
 message StreamPlaybackResponse {

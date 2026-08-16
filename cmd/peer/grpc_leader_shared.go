@@ -77,7 +77,7 @@ type leaderSharedStream struct {
 	format      streamFormat
 	source      io.ReadCloser
 	sourceName  string
-	closeSource func() error
+	closeStream func() error
 
 	mu       stdsync.Mutex
 	cond     *stdsync.Cond
@@ -88,6 +88,8 @@ type leaderSharedStream struct {
 	lastErr  error
 	subs     map[string]*leaderSharedSubscriber
 	metrics  leaderSharedHealthMetrics
+
+	encoder audioEncoder
 }
 
 type leaderSharedHealthMetrics struct {
@@ -97,6 +99,11 @@ type leaderSharedHealthMetrics struct {
 	SlowDisconnects int64
 	SendFailures    int64
 	MaxBuffered     int
+	PCMBytes        int64
+	PayloadBytes    int64
+	EncodeTotal     time.Duration
+	EncodeMax       time.Duration
+	EncodeErrors    int64
 }
 
 type leaderSharedSubscriberSnapshot struct {
@@ -141,12 +148,34 @@ func (ls *leaderSharedStream) logHealth(stage string) {
 			maxLagTarget = snapshot.target
 		}
 	}
-	logDebugf("gRPC stream: leader shared health stage=%s session=%q source=%s subscribers=%d produced=%d ring_start=%d ring_end=%d buffered=%d retention=%s max_buffered=%d ring_evictions=%d subscriber_skips=%d slow_disconnects=%d send_failures=%d slowest_target=%s slowest_lag_chunks=%d slowest_lag=%s",
+	averagePayloadBytes := int64(0)
+	if metrics.ProducedChunks > 0 {
+		averagePayloadBytes = metrics.PayloadBytes / metrics.ProducedChunks
+	}
+	averageEncodeDuration := time.Duration(0)
+	if metrics.ProducedChunks > 0 {
+		averageEncodeDuration = metrics.EncodeTotal / time.Duration(metrics.ProducedChunks)
+	}
+	payloadPercent := 0.0
+	compressionRatio := 0.0
+	if metrics.PCMBytes > 0 {
+		payloadPercent = 100 * float64(metrics.PayloadBytes) / float64(metrics.PCMBytes)
+		compressionRatio = float64(metrics.PCMBytes) / float64(metrics.PayloadBytes)
+	}
+	logDebugf("gRPC stream: leader shared health stage=%s session=%q source=%s subscribers=%d produced=%d pcm_bytes_total=%d payload_bytes_total=%d payload_bytes_avg=%d payload_percent=%.1f%% compression_ratio=%.2fx encode_avg=%s encode_max=%s encode_errors=%d ring_start=%d ring_end=%d buffered=%d retention=%s max_buffered=%d ring_evictions=%d subscriber_skips=%d slow_disconnects=%d send_failures=%d slowest_target=%s slowest_lag_chunks=%d slowest_lag=%s",
 		stage,
 		ls.sessionID,
 		ls.sourceName,
 		subscribers,
 		metrics.ProducedChunks,
+		metrics.PCMBytes,
+		metrics.PayloadBytes,
+		averagePayloadBytes,
+		payloadPercent,
+		compressionRatio,
+		averageEncodeDuration,
+		metrics.EncodeMax,
+		metrics.EncodeErrors,
 		ringStart,
 		ringEnd,
 		buffered,
@@ -192,21 +221,43 @@ func (s *peerControlServer) getOrCreateLeaderSharedStream(req *control.StreamPla
 		return nil, err
 	}
 
+	var encoder audioEncoder
+	codec := payloadCodec(req.GetPayloadCodec())
+	if codec == payloadCodecOpus {
+		encoder, err = newOpusEncoder(format.SampleRate, format.Channels)
+		if err != nil {
+			if closeErr := closeSource(); closeErr != nil {
+				logWarnf("gRPC stream: source close error (%s): %v", sourceName, closeErr)
+			}
+			return nil, fmt.Errorf("create opus encoder: %w", err)
+		}
+	}
+	logInfof("gRPC stream: leader encoding session=%q codec=%s", sessionID, codec)
+
+	closeResources := func() error {
+		sourceErr := closeSource()
+		if encoder == nil {
+			return sourceErr
+		}
+		return errors.Join(sourceErr, encoder.Close())
+	}
+
 	ls := &leaderSharedStream{
 		sessionID:   sessionID,
 		format:      format,
 		source:      source,
 		sourceName:  sourceName,
-		closeSource: closeSource,
+		closeStream: closeResources,
 		chunks:      make([]*control.AudioChunk, 0, leaderSharedRingSize),
 		subs:        make(map[string]*leaderSharedSubscriber),
+		encoder:     encoder,
 	}
 	ls.cond = stdsync.NewCond(&ls.mu)
 
 	s.sessionMu.Lock()
 	if existing, ok := s.leaderSharedStreams[sessionID]; ok {
 		s.sessionMu.Unlock()
-		if closeErr := closeSource(); closeErr != nil {
+		if closeErr := closeResources(); closeErr != nil {
 			logWarnf("gRPC stream: source close error (%s): %v", sourceName, closeErr)
 		}
 		return existing, nil
@@ -306,7 +357,7 @@ func (s *peerControlServer) closeLeaderSharedStream(sessionID string, cause erro
 		sub.fail(cause)
 	}
 
-	if closeErr := ls.closeSource(); closeErr != nil {
+	if closeErr := ls.closeStream(); closeErr != nil {
 		logWarnf("gRPC stream: source close error (%s): %v", ls.sourceName, closeErr)
 	}
 
@@ -334,6 +385,7 @@ func (s *peerControlServer) appendLeaderSharedChunk(ls *leaderSharedStream, chun
 	ls.chunks = append(ls.chunks, chunk)
 	if !chunk.GetEndOfStream() {
 		ls.metrics.ProducedChunks++
+		ls.metrics.PayloadBytes += int64(len(chunk.GetData()))
 	}
 	if len(ls.chunks) > ls.metrics.MaxBuffered {
 		ls.metrics.MaxBuffered = len(ls.chunks)
@@ -359,7 +411,31 @@ func (s *peerControlServer) runLeaderSharedProducer(req *control.StreamPlaybackR
 
 	for {
 		n, err := io.ReadFull(ls.source, buf)
-		if n > 0 {
+
+		if n == len(buf) {
+			payload := buf[:n]
+			ls.mu.Lock()
+			ls.metrics.PCMBytes += int64(len(payload))
+			ls.mu.Unlock()
+			if ls.encoder != nil {
+				encodeStartedAt := time.Now()
+				encoded, encodeErr := ls.encoder.EncodePCM(payload)
+				encodeDuration := time.Since(encodeStartedAt)
+				if encodeErr != nil {
+					ls.mu.Lock()
+					ls.metrics.EncodeErrors++
+					ls.mu.Unlock()
+					failSession(fmt.Errorf("PCM encode failed: %w", encodeErr))
+					return
+				}
+				ls.mu.Lock()
+				ls.metrics.EncodeTotal += encodeDuration
+				if encodeDuration > ls.metrics.EncodeMax {
+					ls.metrics.EncodeMax = encodeDuration
+				}
+				ls.mu.Unlock()
+				payload = encoded
+			}
 			producedAt := time.Now()
 			if paceStream {
 				now := time.Now()
@@ -381,7 +457,7 @@ func (s *peerControlServer) runLeaderSharedProducer(req *control.StreamPlaybackR
 				SessionId:       req.SessionId,
 				AudioId:         req.AudioId,
 				Sequence:        seq,
-				Data:            append([]byte(nil), buf[:n]...),
+				Data:            append([]byte(nil), payload...),
 				SentAtNanos:     sentAt.UnixNano(),
 				ProducedAtNanos: producedAt.UnixNano(),
 				EndOfStream:     false,
@@ -396,6 +472,11 @@ func (s *peerControlServer) runLeaderSharedProducer(req *control.StreamPlaybackR
 			if paceStream {
 				nextSendAt = nextSendAt.Add(chunkDur)
 			}
+		}
+
+		if n > 0 && n < len(buf) {
+			failSession(fmt.Errorf("partial PCM frame: got=%d want=%d: %w", n, len(buf), err))
+			return
 		}
 
 		if err == io.EOF || err == io.ErrUnexpectedEOF {

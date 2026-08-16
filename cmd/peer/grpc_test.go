@@ -120,3 +120,19 @@ func TestIsSlowSubscriberDisconnect(t *testing.T) {
 		t.Fatal("did not expect unrelated transport error to be rejoinable")
 	}
 }
+
+func TestShouldLogChunkIgnoresVariableSizeMismatchInMilestoneMode(t *testing.T) {
+	srv := &peerControlServer{chunkLogEvery: 100}
+
+	if srv.shouldLogChunk(chunkLogModeMilestone, 1, 744, 3840, "opus") {
+		t.Fatal("expected variable-size Opus payload mismatch to be ignored in milestone mode")
+	}
+}
+
+func TestShouldLogChunkFlagsFixedSizeMismatchInMilestoneMode(t *testing.T) {
+	srv := &peerControlServer{chunkLogEvery: 100}
+
+	if !srv.shouldLogChunk(chunkLogModeMilestone, 1, 3000, 3840, "pcm") {
+		t.Fatal("expected fixed-size PCM mismatch to trigger a milestone log")
+	}
+}

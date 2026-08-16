@@ -30,6 +30,7 @@ type config struct {
 	wavPath                     string
 	liveCapture                 bool
 	captureDevice               string
+	streamCodec                 string
 	logMediaCmds                bool
 	streamJitter                time.Duration
 	streamJitterAdaptive        bool
@@ -95,6 +96,17 @@ func normaliseLogLevel(value string) zapcore.Level {
 		return zap.ErrorLevel
 	default:
 		return zap.DebugLevel
+	}
+}
+
+func normaliseStreamCodec(value string) string {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "opus":
+		return "opus"
+	case "pcm":
+		return "pcm"
+	default:
+		return "pcm"
 	}
 }
 
@@ -223,6 +235,7 @@ func parseFlags() config {
 	wavPath := flag.String("wav", "", "optional wav file to play")
 	liveCapture := flag.Bool("live-capture", true, "capture live system audio on leader instead of reading audio-path file")
 	captureDevice := flag.String("capture-device", "default", "system audio capture device (Linux PulseAudio/PipeWire monitor or Windows WASAPI endpoint, default auto device)")
+	streamCodec := flag.String("stream-codec", "pcm", "stream codec to use for live capture (opus|pcm)")
 	logMediaCmds := flag.Bool("log-media-cmds", true, "log ffmpeg/ffplay/aplay commands before execution and on failures")
 	streamJitterMS := flag.Int("stream-jitter-ms", 200, "target jitter buffer delay for streamed playback in milliseconds")
 	streamJitterAdaptive := flag.Bool("stream-jitter-adaptive", true, "adapt jitter buffer delay at runtime based on stream health")
@@ -232,7 +245,7 @@ func parseFlags() config {
 	streamJitterMaxMS := flag.Int("stream-jitter-max-ms", 400, "maximum adaptive jitter delay in milliseconds")
 	streamJitterStepMS := flag.Int("stream-jitter-step-ms", 20, "adaptive jitter adjustment step in milliseconds")
 	chunkLogStdoutMode := flag.String("stream-chunk-log-stdout", "milestone", "chunk log verbosity to stdout: off|milestone|all")
-	chunkLogFileMode := flag.String("stream-chunk-log-file", "all", "chunk log verbosity to file: off|milestone|all")
+	chunkLogFileMode := flag.String("stream-chunk-log-file", "off", "chunk log verbosity to file: off|milestone|all")
 	chunkLogDir := flag.String("stream-chunk-log-dir", "logs", "directory for stream chunk log files")
 	chunkLogEvery := flag.Int("stream-chunk-log-every", 100, "milestone interval for stream chunk logs")
 	logOutput := flag.String("log-output", "both", "application log output mode: stdout|file|both")
@@ -280,6 +293,8 @@ func parseFlags() config {
 		logSessionStamp = time.Now().UTC().Format("20060102T150405Z")
 	}
 
+	normalisedStreamCodec := normaliseStreamCodec(*streamCodec)
+
 	return config{
 		id:                          *id,
 		broadcastIP:                 *broadcastIP,
@@ -290,6 +305,7 @@ func parseFlags() config {
 		wavPath:                     *wavPath,
 		liveCapture:                 *liveCapture,
 		captureDevice:               *captureDevice,
+		streamCodec:                 normalisedStreamCodec,
 		logMediaCmds:                *logMediaCmds,
 		streamJitter:                jitter,
 		streamJitterAdaptive:        *streamJitterAdaptive,
@@ -400,6 +416,7 @@ func newPeerApp(cfg config) (*peerApp, error) {
 			wavPath:                     cfg.wavPath,
 			liveCapture:                 cfg.liveCapture,
 			captureDevice:               cfg.captureDevice,
+			streamCodec:                 cfg.streamCodec,
 			streamJitter:                cfg.streamJitter,
 			streamJitterAdaptive:        cfg.streamJitterAdaptive,
 			streamJitterSoftResync:      cfg.streamJitterSoftResync,

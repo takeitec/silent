@@ -335,6 +335,17 @@ func (s *peerControlServer) receiveAudioFromLeader(ctx context.Context, target s
 		receivedAt time.Time
 	}
 
+	var decoder audioDecoder
+	followerCodec := payloadCodec(req.GetPayloadCodec())
+	if followerCodec == payloadCodecOpus {
+		decoder, err = newOpusDecoder(streamFormat.SampleRate, streamFormat.Channels)
+		if err != nil {
+			return fmt.Errorf("create Opus decoder: %w", err)
+		}
+		defer decoder.Close()
+	}
+	logInfof("gRPC stream: follower decoding session=%q codec=%s", req.SessionId, followerCodec)
+
 	// Dedicated receive goroutine keeps gRPC Recv off the timing-critical playout loop.
 	recvCh := make(chan recvEnvelope, 32)
 	go func() {
@@ -600,7 +611,7 @@ func (s *peerControlServer) receiveAudioFromLeader(ctx context.Context, target s
 		if !driftCorrectionActiveSince.IsZero() {
 			driftCorrectionActiveTotalSnapshot += time.Since(driftCorrectionActiveSince)
 		}
-		logDebugf("gRPC stream: health stage=%s session=%q target=%s received=%d playout_enqueued=%d sink_written=%d late_dropped=%d duplicate_dropped=%d underflows=%d gap_silence=%d catchup_resyncs=%d hard_resyncs=%d sink_queue_depth=%d sink_queue_capacity=%d sink_queue_dropped=%d buffered_total=%d buffered_playable=%d expected_seq=%d queue_delay_total=%s queue_delay_playable=%s delay_error_total=%s delay_error_playable=%s ewma_delay_error=%s playout_interval=%s drift_correction_peak=%s drift_correction_active_total=%s drift_correction_episodes=%d one_way=%s produced_to_recv=%s recv_to_scheduled=%s sink_queue_wait=%s scheduled_to_sink_write=%s produced_to_scheduled=%s produced_to_sink_write=%s sink_write=%s sink_write_window=%s send_block=%s",
+		logDebugf("gRPC stream: health stage=%s session=%q target=%s received=%d playout_enqueued=%d sink_written=%d late_dropped=%d duplicate_dropped=%d underflows=%d gap_silence=%d catchup_resyncs=%d hard_resyncs=%d sink_queue_depth=%d sink_queue_capacity=%d sink_queue_dropped=%d buffered_total=%d buffered_playable=%d expected_seq=%d queue_delay_total=%s queue_delay_playable=%s delay_error_total=%s delay_error_playable=%s ewma_delay_error=%s playout_interval=%s drift_correction_peak=%s drift_correction_active_total=%s drift_correction_episodes=%d one_way=%s produced_to_recv=%s recv_to_scheduled=%s decode=%s sink_queue_wait=%s scheduled_to_sink_write=%s produced_to_scheduled=%s produced_to_sink_write=%s sink_write=%s sink_write_window=%s send_block=%s",
 			stage,
 			req.SessionId,
 			target,
@@ -631,6 +642,7 @@ func (s *peerControlServer) receiveAudioFromLeader(ctx context.Context, target s
 			metrics.OneWaySummary(),
 			metrics.ProducedToRecvSummary(),
 			metrics.RecvToScheduledSummary(),
+			metrics.DecodeSummary(),
 			sinkQueueWait.Summary(),
 			metrics.ScheduledToWriteSummary(),
 			metrics.ProducedToScheduledSummary(),
@@ -1185,8 +1197,20 @@ func (s *peerControlServer) receiveAudioFromLeader(ctx context.Context, target s
 			metrics.DuplicateDropped++
 			return false, nil
 		}
+
+		payload := chunk.GetData()
+		if decoder != nil {
+			decodeStartedAt := time.Now()
+			payload, err = decoder.DecodePacket(payload)
+			if err != nil {
+				metrics.DecodeErrors++
+				return false, fmt.Errorf("decode Opus seq=%d: %w", chunk.GetSequence(), err)
+			}
+			metrics.ObserveDecode(time.Since(decodeStartedAt))
+		}
+
 		queued := queuedChunk{
-			data:       append([]byte(nil), chunk.GetData()...),
+			data:       append([]byte(nil), payload...),
 			receivedAt: env.receivedAt,
 			sentAt:     sentLocal,
 		}
@@ -1198,6 +1222,7 @@ func (s *peerControlServer) receiveAudioFromLeader(ctx context.Context, target s
 				metrics.ObserveSendBlock(queued.sentAt.Sub(producedLocal))
 			}
 		}
+
 		pending[seq] = queued
 		if depth := len(pending); depth > metrics.MaxBufferedChunks {
 			metrics.MaxBufferedChunks = depth
@@ -1220,7 +1245,7 @@ func (s *peerControlServer) receiveAudioFromLeader(ctx context.Context, target s
 
 		playableChunks := contiguousBufferedChunks()
 		extra := fmt.Sprintf("buffered_total=%d buffered_playable=%d queue_delay_total=%s queue_delay_playable=%s delay_error_total=%s", len(pending), playableChunks, currentQueueDelay(), time.Duration(playableChunks)*chunkDur, lastDelayError)
-		s.logChunkEvent("buffered", req.SessionId, target, chunk.GetSequence(), len(chunk.GetData()), streamFormat.ChunkBytes, extra)
+		s.logChunkEvent("buffered", req.SessionId, target, chunk.GetSequence(), len(chunk.GetData()), streamFormat.ChunkBytes, req.GetPayloadCodec(), extra)
 		return false, nil
 	}
 

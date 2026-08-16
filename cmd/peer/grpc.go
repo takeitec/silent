@@ -33,6 +33,7 @@ type peerControlServer struct {
 	wavPath                     string
 	liveCapture                 bool
 	captureDevice               string
+	streamCodec                 string
 	streamJitter                time.Duration
 	streamJitterAdaptive        bool
 	streamJitterSoftResync      bool
@@ -80,7 +81,7 @@ func normaliseChunkLogMode(mode string) string {
 	}
 }
 
-func (s *peerControlServer) shouldLogChunk(mode string, seq int64, size, expectedSize int) bool {
+func (s *peerControlServer) shouldLogChunk(mode string, seq int64, size, expectedSize int, codec string) bool {
 	mode = normaliseChunkLogMode(mode)
 	if mode == chunkLogModeOff {
 		return false
@@ -97,13 +98,18 @@ func (s *peerControlServer) shouldLogChunk(mode string, seq int64, size, expecte
 		return true
 	}
 	if expectedSize > 0 && size != expectedSize {
-		return true
+		fixedSizeCodec := strings.TrimSpace(codec) == "" || strings.EqualFold(codec, "pcm")
+		if fixedSizeCodec {
+			return true
+		}
 	}
 	return false
 }
 
-func (s *peerControlServer) logChunkEvent(direction, sessionID, target string, seq int64, size, expectedSize int, extra string) {
-	if !s.shouldLogChunk(s.chunkLogStdoutMode, seq, size, expectedSize) && !s.shouldLogChunk(s.chunkLogFileMode, seq, size, expectedSize) {
+func (s *peerControlServer) logChunkEvent(direction, sessionID, target string, seq int64, size, expectedSize int, codec string, extra string) {
+	stdoutShouldLog := s.shouldLogChunk(s.chunkLogStdoutMode, seq, size, expectedSize, codec)
+	fileShouldLog := s.shouldLogChunk(s.chunkLogFileMode, seq, size, expectedSize, codec)
+	if !stdoutShouldLog && !fileShouldLog {
 		return
 	}
 
@@ -115,11 +121,11 @@ func (s *peerControlServer) logChunkEvent(direction, sessionID, target string, s
 		msg = fmt.Sprintf("%s %s", msg, strings.TrimSpace(extra))
 	}
 
-	if s.shouldLogChunk(s.chunkLogStdoutMode, seq, size, expectedSize) {
+	if stdoutShouldLog {
 		logInfof("%s", msg)
 	}
 
-	if s.shouldLogChunk(s.chunkLogFileMode, seq, size, expectedSize) && s.chunkLogFile != nil {
+	if fileShouldLog && s.chunkLogFile != nil {
 		s.chunkLogMu.Lock()
 		_, _ = fmt.Fprintf(s.chunkLogFile, "%s %s\n", time.Now().Format(time.RFC3339Nano), msg)
 		s.chunkLogMu.Unlock()
@@ -280,7 +286,11 @@ func (s *peerControlServer) StartStreamPlayback(_ context.Context, req *control.
 	streamReq := normaliseStreamRequest(req)
 	streamFormat := normaliseStreamPlaybackRequest(streamReq)
 	sessionID := normaliseSessionID(streamReq.SessionId)
-	logInfof("gRPC stream: StartStreamPlayback session=%q audio_id=%q audio_path=%q shared_at=%s", sessionID, streamReq.AudioId, streamReq.AudioPath, time.Unix(0, streamReq.SharedAtNanos).Format(time.RFC3339Nano))
+	// Only the leader decides the codec; followers must keep whatever the leader sent them.
+	if s.isLeader {
+		streamReq.PayloadCodec = s.streamCodec
+	}
+	logInfof("gRPC stream: StartStreamPlayback session=%q audio_id=%q audio_path=%q codec=%s shared_at=%s", sessionID, streamReq.AudioId, streamReq.AudioPath, streamReq.PayloadCodec, time.Unix(0, streamReq.SharedAtNanos).Format(time.RFC3339Nano))
 
 	// If this peer is already handling the same session, reject the duplicate request.
 	if !s.beginSession(sessionID) {
@@ -657,7 +667,7 @@ func (s *peerControlServer) StreamAudio(req *control.StreamPlaybackRequest, stre
 				return err
 			}
 			chunksSent++
-			s.logChunkEvent("sent", req.SessionId, target, seq, len(chunk.Data), streamFormat.ChunkBytes, "")
+			s.logChunkEvent("sent", req.SessionId, target, seq, len(chunk.Data), streamFormat.ChunkBytes, req.GetPayloadCodec(), "")
 			if paceStream {
 				nextSendAt = nextSendAt.Add(chunkDur)
 			}

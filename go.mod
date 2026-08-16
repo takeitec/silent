@@ -3,6 +3,7 @@ module silent
 go 1.25.0
 
 require (
+	github.com/hraban/opus v0.0.0-20260708213942-bde8e4304501 // indirect
 	go.uber.org/multierr v1.10.0 // indirect
 	go.uber.org/zap v1.28.0 // indirect
 	golang.org/x/net v0.55.0 // indirect
