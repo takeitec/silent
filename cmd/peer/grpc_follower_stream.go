@@ -397,6 +397,8 @@ func (s *peerControlServer) receiveAudioFromLeader(ctx context.Context, target s
 	ewmaDelayErrorInitialized := false
 	softResyncSignWindows := 0
 	lastSoftResyncSign := 0
+	lastSoftResyncSuppressedAt := time.Time{}
+	softResyncSuppressed := false
 	lastAdaptiveControlAt := time.Time{}
 	lastSoftControlAt := time.Time{}
 	lastAdaptiveResetAt := time.Time{}
@@ -905,10 +907,22 @@ func (s *peerControlServer) receiveAudioFromLeader(ctx context.Context, target s
 			if !inWarmup && (hardByDelay && hardByChunks) && hardResyncAllowed(now) {
 				hardResync(now, fmt.Sprintf("delay_error=%s threshold=%s backlog_chunks=%d chunk_threshold=%d", delayErrorRaw, hardResyncDelayThreshold, chunkBacklog, hardResyncChunkThreshold))
 			} else if softResyncEnabled && softResyncQuiet {
-				logDebugf("gRPC stream: soft resync suppressed (quiet after adaptive jitter) session=%q target=%s delay_error=%s ewma_delay_error=%s backlog_chunks=%d", req.SessionId, target, delayErrorRaw, delayErrorEWMA, chunkBacklog)
+				if !softResyncSuppressed {
+					logDebugf("gRPC stream: soft resync suppression started session=%q target=%s delay_error=%s ewma_delay_error=%s backlog_chunks=%d", req.SessionId, target, delayErrorRaw, delayErrorEWMA, chunkBacklog)
+					softResyncSuppressed = true
+					lastSoftResyncSuppressedAt = now
+				} else if now.Sub(lastSoftResyncSuppressedAt) >= 10*time.Second {
+					logDebugf("gRPC stream: soft resync suppression still active session=%q target=%s delay_error=%s ewma_delay_error=%s backlog_chunks=%d", req.SessionId, target, delayErrorRaw, delayErrorEWMA, chunkBacklog)
+					lastSoftResyncSuppressedAt = now
+				}
 				// Adaptive just moved the target; let the buffer settle against it
 				// before nudging playout timing again.
 			} else if softResyncEnabled && !inWarmup && now.After(hardResyncWindowUntil) && absoluteDuration(delayErrorEWMA) > softResyncBand {
+				if softResyncSuppressed {
+					logDebugf("gRPC stream: soft resync suppression ended session=%q target=%s delay_error=%s ewma_delay_error=%s backlog_chunks=%d", req.SessionId, target, delayErrorRaw, delayErrorEWMA, chunkBacklog)
+					softResyncSuppressed = false
+					lastSoftResyncSuppressedAt = time.Time{}
+				}
 				starving := delayErrorEWMA < 0 && chunkBacklog < minSoftResyncBufferedChunks
 				if !starving && (lastSoftResyncAt.IsZero() || now.Sub(lastSoftResyncAt) >= softResyncCooldown) {
 					sign := 1
@@ -982,6 +996,11 @@ func (s *peerControlServer) receiveAudioFromLeader(ctx context.Context, target s
 			} else if softResyncEnabled {
 				softResyncSignWindows = 0
 				lastSoftResyncSign = 0
+				if softResyncSuppressed {
+					logDebugf("gRPC stream: soft resync suppression ended session=%q target=%s delay_error=%s ewma_delay_error=%s backlog_chunks=%d", req.SessionId, target, delayErrorRaw, delayErrorEWMA, chunkBacklog)
+					softResyncSuppressed = false
+					lastSoftResyncSuppressedAt = time.Time{}
+				}
 			}
 
 			errorMagnitude := absoluteDuration(delayErrorEWMA)
