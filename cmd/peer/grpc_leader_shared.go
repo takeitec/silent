@@ -224,7 +224,7 @@ func (s *peerControlServer) getOrCreateLeaderSharedStream(req *control.StreamPla
 	var encoder audioEncoder
 	codec := payloadCodec(req.GetPayloadCodec())
 	if codec == payloadCodecOpus {
-		encoder, err = newOpusEncoder(format.SampleRate, format.Channels)
+		encoder, err = newOpusEncoder(format.SampleRate, format.Channels, s.opusBitrate)
 		if err != nil {
 			if closeErr := closeSource(); closeErr != nil {
 				logWarnf("gRPC stream: source close error (%s): %v", sourceName, closeErr)
@@ -409,6 +409,9 @@ func (s *peerControlServer) runLeaderSharedProducer(req *control.StreamPlaybackR
 		s.stopLeaderSession(context.Background(), ls.sessionID, err.Error())
 	}
 
+	const maxConsecutiveEncodeErrors = 25 // ~500ms of continuous failure at 20ms/chunk
+	consecutiveEncodeErrors := 0
+
 	for {
 		n, err := io.ReadFull(ls.source, buf)
 
@@ -425,9 +428,18 @@ func (s *peerControlServer) runLeaderSharedProducer(req *control.StreamPlaybackR
 					ls.mu.Lock()
 					ls.metrics.EncodeErrors++
 					ls.mu.Unlock()
-					failSession(fmt.Errorf("PCM encode failed: %w", encodeErr))
-					return
+					consecutiveEncodeErrors++
+					logWarnf("gRPC stream: Opus encode failed, dropping frame session=%q err=%v consecutive=%d", ls.sessionID, encodeErr, consecutiveEncodeErrors)
+					if consecutiveEncodeErrors >= maxConsecutiveEncodeErrors {
+						failSession(fmt.Errorf("PCM encode failed %d times consecutively, giving up: %w", consecutiveEncodeErrors, encodeErr))
+						return
+					}
+					// Drop just this one frame rather than the whole
+					// session; followers already handle a sequence gap
+					// via their own concealment/underflow path.
+					continue
 				}
+				consecutiveEncodeErrors = 0
 				ls.mu.Lock()
 				ls.metrics.EncodeTotal += encodeDuration
 				if encodeDuration > ls.metrics.EncodeMax {

@@ -34,6 +34,7 @@ type peerControlServer struct {
 	liveCapture                 bool
 	captureDevice               string
 	streamCodec                 string
+	opusBitrate                 int
 	streamJitter                time.Duration
 	streamJitterAdaptive        bool
 	streamJitterSoftResync      bool

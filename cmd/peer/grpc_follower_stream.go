@@ -336,6 +336,8 @@ func (s *peerControlServer) receiveAudioFromLeader(ctx context.Context, target s
 	}
 
 	var decoder audioDecoder
+	const maxConsecutiveDecodeErrors = 25 // ~500ms of continuous failure at 20ms/chunk
+	consecutiveDecodeErrors := 0
 	followerCodec := payloadCodec(req.GetPayloadCodec())
 	if followerCodec == payloadCodecOpus {
 		decoder, err = newOpusDecoder(streamFormat.SampleRate, streamFormat.Channels)
@@ -1201,11 +1203,30 @@ func (s *peerControlServer) receiveAudioFromLeader(ctx context.Context, target s
 		payload := chunk.GetData()
 		if decoder != nil {
 			decodeStartedAt := time.Now()
-			payload, err = decoder.DecodePacket(payload)
-			if err != nil {
+			decoded, decodeErr := decoder.DecodePacket(payload)
+			if decodeErr != nil {
+				// A single corrupted/truncated packet shouldn't take down
+				// the whole stream. Conceal it (keeps the decoder's
+				// internal state consistent) and carry on. But a long
+				// run of consecutive failures usually means something
+				// structural (e.g. a codec mismatch between leader and
+				// follower) rather than transient packet loss, so escalate
+				// instead of concealing forever.
 				metrics.DecodeErrors++
-				return false, fmt.Errorf("decode Opus seq=%d: %w", chunk.GetSequence(), err)
+				consecutiveDecodeErrors++
+				logWarnf("gRPC stream: Opus decode failed, concealing seq=%d session=%q target=%s err=%v consecutive=%d", chunk.GetSequence(), req.SessionId, target, decodeErr, consecutiveDecodeErrors)
+				if consecutiveDecodeErrors >= maxConsecutiveDecodeErrors {
+					return false, fmt.Errorf("decode Opus seq=%d: %d consecutive failures, giving up: %w", chunk.GetSequence(), consecutiveDecodeErrors, decodeErr)
+				}
+				concealed, concealErr := decoder.Conceal()
+				if concealErr != nil {
+					return false, fmt.Errorf("decode Opus seq=%d: %w (conceal also failed: %v)", chunk.GetSequence(), decodeErr, concealErr)
+				}
+				decoded = concealed
+			} else {
+				consecutiveDecodeErrors = 0
 			}
+			payload = decoded
 			metrics.ObserveDecode(time.Since(decodeStartedAt))
 		}
 

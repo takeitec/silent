@@ -5,7 +5,7 @@ import (
 )
 
 func TestOpusEncoderInitialization(t *testing.T) {
-	encoder, err := newOpusEncoder(48000, 2)
+	encoder, err := newOpusEncoder(48000, 2, opus128kbpsBitrate)
 	if err != nil {
 		t.Fatalf("Failed to initialize Opus encoder: %v", err)
 	}
@@ -26,7 +26,7 @@ func TestOpusEncoderInitialization(t *testing.T) {
 }
 
 func TestOpusEncoderRejectsPartialFrame(t *testing.T) {
-	encoder, err := newOpusEncoder(48000, 2)
+	encoder, err := newOpusEncoder(48000, 2, opus128kbpsBitrate)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -39,7 +39,7 @@ func TestOpusEncoderRejectsPartialFrame(t *testing.T) {
 }
 
 func TestOpusEncoderEncodesOneFrame(t *testing.T) {
-	encoder, err := newOpusEncoder(48000, 2)
+	encoder, err := newOpusEncoder(48000, 2, opus128kbpsBitrate)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -76,7 +76,7 @@ func TestOpusDecoderInitialization(t *testing.T) {
 }
 
 func TestOpusDecoderDecodesOneFrame(t *testing.T) {
-	encoder, err := newOpusEncoder(48000, 2)
+	encoder, err := newOpusEncoder(48000, 2, opus128kbpsBitrate)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -111,12 +111,12 @@ func TestOpusDecoderRejectsInvalidPacket(t *testing.T) {
 
 	_, err = decoder.DecodePacket(nil)
 	if err == nil {
-		t.Fatal("expected empty packet to be rejected")
+		t.Fatal("expected empty packet to be rejected; use Conceal for lost frames")
 	}
 }
 
 func TestOpusEncoderAndDecoderIntegration(t *testing.T) {
-	encoder, err := newOpusEncoder(48000, 2)
+	encoder, err := newOpusEncoder(48000, 2, opus128kbpsBitrate)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -152,5 +152,46 @@ func TestOpusEncoderAndDecoderIntegration(t *testing.T) {
 	if len(packet) >= len(originalPCM) {
 		t.Fatalf("expected compressed packet smaller than PCM: packet=%d pcm=%d",
 			len(packet), len(originalPCM))
+	}
+}
+
+func TestOpusDecoderConcealsLostFrame(t *testing.T) {
+	encoder, err := newOpusEncoder(48000, 2, opus128kbpsBitrate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer encoder.Close()
+
+	decoder, err := newOpusDecoder(48000, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer decoder.Close()
+
+	// Decode one real frame so the decoder has state to conceal from.
+	packet, err := encoder.EncodePCM(make([]byte, 3840))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := decoder.DecodePacket(packet); err != nil {
+		t.Fatalf("decode real frame: %v", err)
+	}
+
+	// Simulate the next frame never arriving.
+	concealed, err := decoder.Conceal()
+	if err != nil {
+		t.Fatalf("Conceal: %v", err)
+	}
+	if len(concealed) != 3840 {
+		t.Fatalf("expected concealed frame length 3840, got %d", len(concealed))
+	}
+
+	// Decoder should recover cleanly and keep decoding after concealment.
+	packet2, err := encoder.EncodePCM(make([]byte, 3840))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := decoder.DecodePacket(packet2); err != nil {
+		t.Fatalf("decode after concealment: %v", err)
 	}
 }
