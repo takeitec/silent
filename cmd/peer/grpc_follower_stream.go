@@ -1207,6 +1207,19 @@ func (s *peerControlServer) receiveAudioFromLeader(ctx context.Context, target s
 			expectedSeq = nextSequence
 			initialized = true
 			latestSeqReceived = nextSequence - 1
+			if decoder != nil {
+				// This is a known, deliberate jump (e.g. a lagging
+				// subscriber fast-forwarded past evicted ring-buffer
+				// chunks) - not a few missing frames. Concealment
+				// assumes continuity across the gap and isn't
+				// appropriate here; reset the decoder so the next real
+				// packet decodes cleanly instead of using state that
+				// belongs to audio from before the jump.
+				if err := decoder.Reset(); err != nil {
+					logWarnf("gRPC stream: Opus decoder reset failed after discontinuity session=%q target=%s err=%v", req.SessionId, target, err)
+				}
+				consecutiveDecodeErrors = 0
+			}
 			logWarnf("gRPC stream: sequence discontinuity target=%s session=%q expected_seq=%d next_sequence=%d pending=%d", target, req.SessionId, expectedSeq, nextSequence, len(pending))
 			return false, nil
 		}

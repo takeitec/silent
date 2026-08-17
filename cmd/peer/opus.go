@@ -33,6 +33,19 @@ type audioDecoder interface {
 	// (sequence) order the real packets would have been decoded in, or
 	// the concealment will not reflect the decoder's true internal state.
 	Conceal() ([]byte, error)
+	// Reset clears the decoder's internal predictive state. Call this on
+	// a known, deliberate discontinuity (e.g. the leader fast-forwarding
+	// a lagging subscriber past evicted ring-buffer chunks) rather than
+	// Conceal - concealment is designed to paper over a handful of
+	// missing frames and assumes the audio on either side is continuous;
+	// it is the wrong tool for a large intentional jump to an unrelated
+	// point in the stream, and repeated concealment across a jump like
+	// that tends to degrade toward silence or a hum rather than
+	// producing anything useful. A reset instead lets the next real
+	// packet decode cleanly, as if starting a fresh stream, at the cost
+	// of a single frame's worth of lost overlap-add continuity - a minor,
+	// one-off artifact instead of a stretch of synthesized nonsense.
+	Reset() error
 	Close() error
 }
 
@@ -178,5 +191,18 @@ func (od *OpusDecoder) Conceal() ([]byte, error) {
 
 func (od *OpusDecoder) Close() error {
 	// No resources to release for the Opus decoder in this implementation
+	return nil
+}
+
+func (od *OpusDecoder) Reset() error {
+	// Recreate the underlying decoder rather than relying on an in-place
+	// reset method, since this is cheap (no allocation on the hot path -
+	// it only runs on a discontinuity, not per-chunk) and works
+	// regardless of whether the wrapped library exposes a native reset.
+	decoder, err := opus.NewDecoder(od.sampleRate, od.channels)
+	if err != nil {
+		return fmt.Errorf("reset Opus decoder: %w", err)
+	}
+	od.decoder = decoder
 	return nil
 }
