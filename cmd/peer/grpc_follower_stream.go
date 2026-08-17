@@ -657,6 +657,63 @@ func (s *peerControlServer) receiveAudioFromLeader(ctx context.Context, target s
 		sinkQueueWait = newDelaySummary()
 	}
 
+	// decodeForPlayout decodes a raw payload (Opus) into PCM at the moment
+	// it's actually due to play, so decode calls happen in true
+	// chronological order and the decoder's predictive state stays
+	// meaningful. On a decode failure it conceals (rather than failing
+	// the stream) and escalates only after a run of consecutive failures,
+	// which usually indicates something structural rather than transient
+	// packet corruption.
+	decodeForPlayout := func(seq int64, payload []byte) ([]byte, error) {
+		if decoder == nil {
+			return payload, nil
+		}
+		decodeStartedAt := time.Now()
+		decoded, decodeErr := decoder.DecodePacket(payload)
+		if decodeErr != nil {
+			// A single corrupted/truncated packet shouldn't take down
+			// the whole stream. Conceal it (keeps the decoder's
+			// internal state consistent) and carry on. But a long
+			// run of consecutive failures usually means something
+			// structural (e.g. a codec mismatch between leader and
+			// follower) rather than transient packet loss, so escalate
+			// instead of concealing forever.
+			metrics.DecodeErrors++
+			consecutiveDecodeErrors++
+			logWarnf("gRPC stream: Opus decode failed, concealing seq=%d session=%q target=%s err=%v consecutive=%d", seq, req.SessionId, target, decodeErr, consecutiveDecodeErrors)
+			if consecutiveDecodeErrors >= maxConsecutiveDecodeErrors {
+				return nil, fmt.Errorf("decode Opus seq=%d: %d consecutive failures, giving up: %w", seq, consecutiveDecodeErrors, decodeErr)
+			}
+			concealed, concealErr := decoder.Conceal()
+			if concealErr != nil {
+				return nil, fmt.Errorf("decode Opus seq=%d: %w (conceal also failed: %v)", seq, decodeErr, concealErr)
+			}
+			decoded = concealed
+		} else {
+			consecutiveDecodeErrors = 0
+		}
+		metrics.ObserveDecode(time.Since(decodeStartedAt))
+		return decoded, nil
+	}
+
+	// concealForGap synthesizes audio for a sequence number that never
+	// arrived at all, using the decoder's own packet-loss concealment
+	// (correct here, unlike at ingest time, because this runs exactly
+	// when the gap is actually reached in playout order). Falls back to
+	// silence if concealment itself fails, rather than treating that as
+	// fatal - a missing frame is already an expected, recoverable event.
+	concealForGap := func(seq int64) []byte {
+		if decoder == nil {
+			return silenceChunk
+		}
+		concealed, err := decoder.Conceal()
+		if err != nil {
+			logWarnf("gRPC stream: Opus conceal failed for gap seq=%d session=%q target=%s err=%v, using silence", seq, req.SessionId, target, err)
+			return silenceChunk
+		}
+		return concealed
+	}
+
 	// drainReady advances wall-clock playout and emits either queued audio or gap-fill silence.
 	drainReady := func(now time.Time) error {
 		if !initialized {
@@ -686,13 +743,17 @@ func (s *peerControlServer) receiveAudioFromLeader(ctx context.Context, target s
 				delete(pending, expectedSeq)
 				missingSeqHoldCount = 0
 				metrics.PlayoutEnqueuedChunks++
-				if err := writeAudio(queued.data, expectedSeq, "chunk", nextPlayoutAt, queued); err != nil {
+				decoded, decodeErr := decodeForPlayout(expectedSeq, queued.data)
+				if decodeErr != nil {
+					return decodeErr
+				}
+				if err := writeAudio(decoded, expectedSeq, "chunk", nextPlayoutAt, queued); err != nil {
 					return err
 				}
 			} else {
 				metrics.Underflows++
 				metrics.GapFillSilence++
-				if err := writeAudio(silenceChunk, expectedSeq, "silence-gap", nextPlayoutAt, queuedChunk{}); err != nil {
+				if err := writeAudio(concealForGap(expectedSeq), expectedSeq, "silence-gap", nextPlayoutAt, queuedChunk{}); err != nil {
 					return err
 				}
 				if eosSeen || missingSeqHoldCount >= missingSeqHoldChunks {
@@ -1200,38 +1261,18 @@ func (s *peerControlServer) receiveAudioFromLeader(ctx context.Context, target s
 			return false, nil
 		}
 
-		payload := chunk.GetData()
-		if decoder != nil {
-			decodeStartedAt := time.Now()
-			decoded, decodeErr := decoder.DecodePacket(payload)
-			if decodeErr != nil {
-				// A single corrupted/truncated packet shouldn't take down
-				// the whole stream. Conceal it (keeps the decoder's
-				// internal state consistent) and carry on. But a long
-				// run of consecutive failures usually means something
-				// structural (e.g. a codec mismatch between leader and
-				// follower) rather than transient packet loss, so escalate
-				// instead of concealing forever.
-				metrics.DecodeErrors++
-				consecutiveDecodeErrors++
-				logWarnf("gRPC stream: Opus decode failed, concealing seq=%d session=%q target=%s err=%v consecutive=%d", chunk.GetSequence(), req.SessionId, target, decodeErr, consecutiveDecodeErrors)
-				if consecutiveDecodeErrors >= maxConsecutiveDecodeErrors {
-					return false, fmt.Errorf("decode Opus seq=%d: %d consecutive failures, giving up: %w", chunk.GetSequence(), consecutiveDecodeErrors, decodeErr)
-				}
-				concealed, concealErr := decoder.Conceal()
-				if concealErr != nil {
-					return false, fmt.Errorf("decode Opus seq=%d: %w (conceal also failed: %v)", chunk.GetSequence(), decodeErr, concealErr)
-				}
-				decoded = concealed
-			} else {
-				consecutiveDecodeErrors = 0
-			}
-			payload = decoded
-			metrics.ObserveDecode(time.Since(decodeStartedAt))
-		}
-
+		// Store the raw payload (PCM or Opus, whichever the stream is
+		// using) as received. Decoding happens later, at playout time in
+		// drainReady, rather than here at arrival time. This matters for
+		// Opus specifically: the decoder carries predictive state across
+		// frames, so decode calls must happen in true chronological
+		// (playout) order for concealment of a missing frame to be
+		// correct. Decoding eagerly here, ahead of when a chunk is
+		// actually due to play, would let the decoder race ahead of
+		// buffered-but-not-yet-played chunks, leaving Conceal() nothing
+		// sensible to reconstruct from when a real gap is found later.
 		queued := queuedChunk{
-			data:       append([]byte(nil), payload...),
+			data:       append([]byte(nil), chunk.GetData()...),
 			receivedAt: env.receivedAt,
 			sentAt:     sentLocal,
 		}
