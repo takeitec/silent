@@ -33,8 +33,9 @@ type peerControlServer struct {
 	wavPath                     string
 	liveCapture                 bool
 	captureDevice               string
-	streamCodec                 string
+	streamCodec                 payloadCodec
 	opusBitrate                 int
+	opusImplementation          opusImplementation
 	streamJitter                time.Duration
 	streamJitterAdaptive        bool
 	streamJitterSoftResync      bool
@@ -289,7 +290,7 @@ func (s *peerControlServer) StartStreamPlayback(_ context.Context, req *control.
 	sessionID := normaliseSessionID(streamReq.SessionId)
 	// Only the leader decides the codec; followers must keep whatever the leader sent them.
 	if s.isLeader {
-		streamReq.PayloadCodec = s.streamCodec
+		streamReq.PayloadCodec = string(s.streamCodec)
 	}
 	logInfof("gRPC stream: StartStreamPlayback session=%q audio_id=%q audio_path=%q codec=%s shared_at=%s", sessionID, streamReq.AudioId, streamReq.AudioPath, streamReq.PayloadCodec, time.Unix(0, streamReq.SharedAtNanos).Format(time.RFC3339Nano))
 

@@ -306,7 +306,7 @@ func (s *peerControlServer) receiveAudioFromLeader(ctx context.Context, target s
 			return nil
 		}
 		request := sinkWriteRequest{
-			payload:     payload,
+			payload:     append([]byte(nil), payload...),
 			seq:         seq,
 			source:      source,
 			enqueuedAt:  time.Now(),
@@ -340,7 +340,7 @@ func (s *peerControlServer) receiveAudioFromLeader(ctx context.Context, target s
 	consecutiveDecodeErrors := 0
 	followerCodec := payloadCodec(req.GetPayloadCodec())
 	if followerCodec == payloadCodecOpus {
-		decoder, err = newOpusDecoder(streamFormat.SampleRate, streamFormat.Channels)
+		decoder, err = newOpusDecoder(s.opusImplementation, streamFormat.SampleRate, streamFormat.Channels)
 		if err != nil {
 			return fmt.Errorf("create Opus decoder: %w", err)
 		}

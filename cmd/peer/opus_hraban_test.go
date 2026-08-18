@@ -4,8 +4,8 @@ import (
 	"testing"
 )
 
-func TestOpusEncoderInitialization(t *testing.T) {
-	encoder, err := newOpusEncoder(48000, 2, opus128kbpsBitrate)
+func TestHrabanOpusEncoderInitialization(t *testing.T) {
+	encoder, err := newHrabanOpusEncoder(48000, 2, opus128kbpsBitrate)
 	if err != nil {
 		t.Fatalf("Failed to initialize Opus encoder: %v", err)
 	}
@@ -25,8 +25,8 @@ func TestOpusEncoderInitialization(t *testing.T) {
 	}
 }
 
-func TestOpusEncoderRejectsPartialFrame(t *testing.T) {
-	encoder, err := newOpusEncoder(48000, 2, opus128kbpsBitrate)
+func TestHrabanOpusEncoderRejectsPartialFrame(t *testing.T) {
+	encoder, err := newHrabanOpusEncoder(48000, 2, opus128kbpsBitrate)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -38,8 +38,8 @@ func TestOpusEncoderRejectsPartialFrame(t *testing.T) {
 	}
 }
 
-func TestOpusEncoderEncodesOneFrame(t *testing.T) {
-	encoder, err := newOpusEncoder(48000, 2, opus128kbpsBitrate)
+func TestHrabanOpusEncoderEncodesOneFrame(t *testing.T) {
+	encoder, err := newHrabanOpusEncoder(48000, 2, opus128kbpsBitrate)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -54,8 +54,8 @@ func TestOpusEncoderEncodesOneFrame(t *testing.T) {
 	}
 }
 
-func TestOpusDecoderInitialization(t *testing.T) {
-	decoder, err := newOpusDecoder(48000, 2)
+func TestHrabanOpusDecoderInitialization(t *testing.T) {
+	decoder, err := newHrabanOpusDecoder(48000, 2)
 	if err != nil {
 		t.Fatalf("Failed to initialize Opus decoder: %v", err)
 	}
@@ -75,14 +75,14 @@ func TestOpusDecoderInitialization(t *testing.T) {
 	}
 }
 
-func TestOpusDecoderDecodesOneFrame(t *testing.T) {
-	encoder, err := newOpusEncoder(48000, 2, opus128kbpsBitrate)
+func TestHrabanOpusDecoderDecodesOneFrame(t *testing.T) {
+	encoder, err := newHrabanOpusEncoder(48000, 2, opus128kbpsBitrate)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer encoder.Close()
 
-	decoder, err := newOpusDecoder(48000, 2)
+	decoder, err := newHrabanOpusDecoder(48000, 2)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -102,8 +102,8 @@ func TestOpusDecoderDecodesOneFrame(t *testing.T) {
 	}
 }
 
-func TestOpusDecoderRejectsInvalidPacket(t *testing.T) {
-	decoder, err := newOpusDecoder(48000, 2)
+func TestHrabanOpusDecoderRejectsInvalidPacket(t *testing.T) {
+	decoder, err := newHrabanOpusDecoder(48000, 2)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -115,14 +115,14 @@ func TestOpusDecoderRejectsInvalidPacket(t *testing.T) {
 	}
 }
 
-func TestOpusEncoderAndDecoderIntegration(t *testing.T) {
-	encoder, err := newOpusEncoder(48000, 2, opus128kbpsBitrate)
+func TestHrabanOpusEncoderAndDecoderIntegration(t *testing.T) {
+	encoder, err := newHrabanOpusEncoder(48000, 2, opus128kbpsBitrate)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer encoder.Close()
 
-	decoder, err := newOpusDecoder(48000, 2)
+	decoder, err := newHrabanOpusDecoder(48000, 2)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -155,14 +155,14 @@ func TestOpusEncoderAndDecoderIntegration(t *testing.T) {
 	}
 }
 
-func TestOpusDecoderConcealsLostFrame(t *testing.T) {
-	encoder, err := newOpusEncoder(48000, 2, opus128kbpsBitrate)
+func TestHrabanOpusDecoderConcealsLostFrame(t *testing.T) {
+	encoder, err := newHrabanOpusEncoder(48000, 2, opus128kbpsBitrate)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer encoder.Close()
 
-	decoder, err := newOpusDecoder(48000, 2)
+	decoder, err := newHrabanOpusDecoder(48000, 2)
 	if err != nil {
 		t.Fatal(err)
 	}

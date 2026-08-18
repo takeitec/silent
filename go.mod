@@ -4,6 +4,7 @@ go 1.25.0
 
 require (
 	github.com/hraban/opus v0.0.0-20260708213942-bde8e4304501 // indirect
+	github.com/pion/opus v0.1.0 // indirect
 	go.uber.org/multierr v1.10.0 // indirect
 	go.uber.org/zap v1.28.0 // indirect
 	golang.org/x/net v0.55.0 // indirect
@@ -13,3 +14,5 @@ require (
 	google.golang.org/grpc v1.83.0 // indirect
 	google.golang.org/protobuf v1.36.11 // indirect
 )
+
+replace github.com/pion/opus => ../opus

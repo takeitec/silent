@@ -1,17 +1,20 @@
 package main
 
 import (
-	"fmt"
+	"strings"
 	"time"
-
-	"github.com/hraban/opus"
 )
 
 type payloadCodec string
 
+type opusImplementation string
+
 const (
 	payloadCodecPCM  payloadCodec = "pcm"
 	payloadCodecOpus payloadCodec = "opus"
+
+	opusImplementationHraban opusImplementation = "hraban"
+	opusImplementationPion   opusImplementation = "pion"
 
 	opusFrameDuration  = 20 * time.Millisecond
 	opus128kbpsBitrate = 128000
@@ -49,160 +52,46 @@ type audioDecoder interface {
 	Close() error
 }
 
-type OpusEncoder struct {
-	encoder       *opus.Encoder
-	sampleRate    int
-	channels      int
-	frameSamples  int // per channel: 960 for 20 ms at 48 kHz
-	framePCMBytes int // 3840 for stereo s16le
-
-	// Reused across calls to avoid a heap allocation on every 20ms frame.
-	sampleBuf []int16
-	outBuf    []byte
+func normaliseStreamCodec(value string) payloadCodec {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "opus":
+		return payloadCodecOpus
+	case "pcm":
+		return payloadCodecPCM
+	default:
+		return payloadCodecPCM
+	}
 }
 
-type OpusDecoder struct {
-	decoder       *opus.Decoder
-	sampleRate    int
-	channels      int
-	frameSamples  int // per channel: 960 for 20 ms at 48 kHz
-	framePCMBytes int // 3840 for stereo s16le
-
-	// Reused across calls to avoid a heap allocation on every 20ms frame.
-	sampleBuf []int16
+func normaliseOpusImplementation(value string) opusImplementation {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "pion":
+		return opusImplementationPion
+	case "hraban":
+		fallthrough
+	default:
+		return opusImplementationHraban
+	}
 }
 
-func newOpusEncoder(sampleRate int, channels int, bitrate int) (*OpusEncoder, error) {
-	encoder, err := opus.NewEncoder(sampleRate, channels, opus.Application(opus.AppAudio))
-	if err != nil {
-		return nil, err
+func newOpusEncoder(implementation opusImplementation, sampleRate int, channels int, bitrate int) (audioEncoder, error) {
+	switch implementation {
+	case opusImplementationPion:
+		return newPionOpusEncoder(sampleRate, channels, bitrate)
+	case opusImplementationHraban:
+		fallthrough
+	default:
+		return newHrabanOpusEncoder(sampleRate, channels, bitrate)
 	}
-	if bitrate <= 0 {
-		bitrate = opus128kbpsBitrate
-	}
-	if err := encoder.SetBitrate(bitrate); err != nil {
-		return nil, fmt.Errorf("set Opus bitrate: %w", err)
-	}
-	frameSamples := sampleRate * int(opusFrameDuration) / int(time.Second)
-	framePCMBytes := frameSamples * channels * 2
-	return &OpusEncoder{
-		encoder:       encoder,
-		sampleRate:    sampleRate,
-		channels:      channels,
-		frameSamples:  frameSamples,
-		framePCMBytes: framePCMBytes,
-		sampleBuf:     make([]int16, frameSamples*channels),
-		outBuf:        make([]byte, opusMaxPacketBytes),
-	}, nil
 }
 
-func (oe *OpusEncoder) EncodePCM(pcm []byte) ([]byte, error) {
-	// Validate PCM length
-	if len(pcm) != oe.framePCMBytes {
-		return nil, fmt.Errorf(
-			"invalid Opus PCM frame: got=%d bytes want=%d bytes sample_rate=%d channels=%d frame_samples=%d",
-			len(pcm),
-			oe.framePCMBytes,
-			oe.sampleRate,
-			oe.channels,
-			oe.frameSamples,
-		)
+func newOpusDecoder(implementation opusImplementation, sampleRate int, channels int) (audioDecoder, error) {
+	switch implementation {
+	case opusImplementationPion:
+		return newPionOpusDecoder(sampleRate, channels)
+	case opusImplementationHraban:
+		fallthrough
+	default:
+		return newHrabanOpusDecoder(sampleRate, channels)
 	}
-
-	// Convert PCM bytes to int16 samples
-	for index := 0; index < oe.frameSamples*oe.channels; index++ {
-		oe.sampleBuf[index] = int16(pcm[index*2]) | int16(pcm[index*2+1])<<8
-	}
-
-	// Encode the samples to Opus. The caller is expected to copy the
-	// result (e.g. via append([]byte(nil), ...)) before the next call,
-	// since oe.outBuf is reused.
-	encodedBytes, err := oe.encoder.Encode(oe.sampleBuf, oe.outBuf)
-	if err != nil {
-		return nil, fmt.Errorf("encode Opus frame: %w", err)
-	}
-
-	return oe.outBuf[:encodedBytes], nil
-}
-
-func (oe *OpusEncoder) Close() error {
-	// No resources to release for the Opus encoder in this implementation
-	return nil
-}
-
-func newOpusDecoder(sampleRate int, channels int) (*OpusDecoder, error) {
-	decoder, err := opus.NewDecoder(sampleRate, channels)
-	if err != nil {
-		return nil, err
-	}
-	frameSamples := sampleRate * int(opusFrameDuration) / int(time.Second)
-	framePCMBytes := frameSamples * channels * 2
-	return &OpusDecoder{
-		decoder:       decoder,
-		sampleRate:    sampleRate,
-		channels:      channels,
-		frameSamples:  frameSamples,
-		framePCMBytes: framePCMBytes,
-		sampleBuf:     make([]int16, frameSamples*channels),
-	}, nil
-}
-
-func (od *OpusDecoder) DecodeInto(packet []byte) ([]byte, error) {
-	decodedSamples, err := od.decoder.Decode(packet, od.sampleBuf)
-	if err != nil {
-		return nil, err
-	}
-
-	// The caller is expected to copy this before the next Decode/Conceal
-	// call, since the backing array is reused.
-	pcm := make([]byte, decodedSamples*od.channels*2)
-	for index := 0; index < decodedSamples*od.channels; index++ {
-		pcm[index*2] = byte(od.sampleBuf[index])
-		pcm[index*2+1] = byte(od.sampleBuf[index] >> 8)
-	}
-
-	return pcm, nil
-}
-
-func (od *OpusDecoder) DecodePacket(packet []byte) ([]byte, error) {
-	if len(packet) == 0 {
-		return nil, fmt.Errorf("decode Opus packet: empty packet (use Conceal for lost frames)")
-	}
-
-	pcm, err := od.DecodeInto(packet)
-	if err != nil {
-		return nil, fmt.Errorf("decode Opus packet: %w", err)
-	}
-	return pcm, nil
-}
-
-// Conceal asks the decoder to synthesize the next frame using its own
-// packet-loss concealment (equivalent to libopus's opus_decode with a NULL
-// packet), rather than callers inserting raw silence. This keeps the
-// decoder's internal predictive state consistent with elapsed time, so the
-// next real packet decodes cleanly instead of picking up mid-gap.
-func (od *OpusDecoder) Conceal() ([]byte, error) {
-	pcm, err := od.DecodeInto(nil)
-	if err != nil {
-		return nil, fmt.Errorf("conceal Opus frame: %w", err)
-	}
-	return pcm, nil
-}
-
-func (od *OpusDecoder) Close() error {
-	// No resources to release for the Opus decoder in this implementation
-	return nil
-}
-
-func (od *OpusDecoder) Reset() error {
-	// Recreate the underlying decoder rather than relying on an in-place
-	// reset method, since this is cheap (no allocation on the hot path -
-	// it only runs on a discontinuity, not per-chunk) and works
-	// regardless of whether the wrapped library exposes a native reset.
-	decoder, err := opus.NewDecoder(od.sampleRate, od.channels)
-	if err != nil {
-		return fmt.Errorf("reset Opus decoder: %w", err)
-	}
-	od.decoder = decoder
-	return nil
 }

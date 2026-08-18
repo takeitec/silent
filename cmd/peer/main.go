@@ -27,8 +27,9 @@ type config struct {
 	wavPath                     string
 	liveCapture                 bool
 	captureDevice               string
-	streamCodec                 string
+	streamCodec                 payloadCodec
 	opusBitrate                 int
+	opusImplementation          opusImplementation
 	logMediaCmds                bool
 	streamJitter                time.Duration
 	streamJitterAdaptive        bool
@@ -53,17 +54,6 @@ type config struct {
 	advertiseHost               string
 }
 
-func normaliseStreamCodec(value string) string {
-	switch strings.ToLower(strings.TrimSpace(value)) {
-	case "opus":
-		return "opus"
-	case "pcm":
-		return "pcm"
-	default:
-		return "pcm"
-	}
-}
-
 func main() {
 	cfg := parseFlags()
 
@@ -74,6 +64,8 @@ func main() {
 	if logCleanup != nil {
 		defer logCleanup()
 	}
+
+	logInfof("peer starting id=%q stream_codec=%s opus_implementation=%s", cfg.id, cfg.streamCodec, cfg.opusImplementation)
 
 	app, err := newPeerApp(cfg)
 	if err != nil {
@@ -95,8 +87,9 @@ func parseFlags() config {
 	wavPath := flag.String("wav", "", "optional wav file to play")
 	liveCapture := flag.Bool("live-capture", true, "capture live system audio on leader instead of reading audio-path file")
 	captureDevice := flag.String("capture-device", "default", "system audio capture device (Linux PulseAudio/PipeWire monitor or Windows WASAPI endpoint, default auto device)")
-	streamCodec := flag.String("stream-codec", "pcm", "stream codec to use for live capture (opus|pcm)")
+	streamCodec := flag.String("stream-codec", string(payloadCodecOpus), "stream codec to use for live capture (opus|pcm)")
 	opusBitrate := flag.Int("opus-bitrate", opus128kbpsBitrate, "Opus encoder bitrate in bits per second (only used if stream-codec=opus)")
+	opusImplementation := flag.String("opus-implementation", string(opusImplementationHraban), "Opus backend implementation to use: hraban|pion")
 	logMediaCmds := flag.Bool("log-media-cmds", true, "log ffmpeg/ffplay/aplay commands before execution and on failures")
 	streamJitterMS := flag.Int("stream-jitter-ms", 200, "target jitter buffer delay for streamed playback in milliseconds")
 	streamJitterAdaptive := flag.Bool("stream-jitter-adaptive", true, "adapt jitter buffer delay at runtime based on stream health")
@@ -155,6 +148,7 @@ func parseFlags() config {
 	}
 
 	normalisedStreamCodec := normaliseStreamCodec(*streamCodec)
+	normalisedOpusImplementation := normaliseOpusImplementation(*opusImplementation)
 
 	return config{
 		id:                          *id,
@@ -168,6 +162,7 @@ func parseFlags() config {
 		captureDevice:               *captureDevice,
 		streamCodec:                 normalisedStreamCodec,
 		opusBitrate:                 *opusBitrate,
+		opusImplementation:          normalisedOpusImplementation,
 		logMediaCmds:                *logMediaCmds,
 		streamJitter:                jitter,
 		streamJitterAdaptive:        *streamJitterAdaptive,
@@ -280,6 +275,7 @@ func newPeerApp(cfg config) (*peerApp, error) {
 			captureDevice:               cfg.captureDevice,
 			streamCodec:                 cfg.streamCodec,
 			opusBitrate:                 cfg.opusBitrate,
+			opusImplementation:          cfg.opusImplementation,
 			streamJitter:                cfg.streamJitter,
 			streamJitterAdaptive:        cfg.streamJitterAdaptive,
 			streamJitterSoftResync:      cfg.streamJitterSoftResync,

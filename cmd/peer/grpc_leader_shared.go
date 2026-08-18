@@ -224,7 +224,7 @@ func (s *peerControlServer) getOrCreateLeaderSharedStream(req *control.StreamPla
 	var encoder audioEncoder
 	codec := payloadCodec(req.GetPayloadCodec())
 	if codec == payloadCodecOpus {
-		encoder, err = newOpusEncoder(format.SampleRate, format.Channels, s.opusBitrate)
+		encoder, err = newOpusEncoder(s.opusImplementation, format.SampleRate, format.Channels, s.opusBitrate)
 		if err != nil {
 			if closeErr := closeSource(); closeErr != nil {
 				logWarnf("gRPC stream: source close error (%s): %v", sourceName, closeErr)
