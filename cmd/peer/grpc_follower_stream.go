@@ -234,7 +234,7 @@ func (s *peerControlServer) buildFollowerPlayoutInit(req *control.StreamPlayback
 	}
 }
 
-func (s *peerControlServer) receiveAudioFromLeader(ctx context.Context, target string, req *control.StreamPlaybackRequest, sharedAt time.Time) error {
+func (s *peerControlServer) receiveAudioFromLeader(ctx context.Context, target string, req *control.StreamPlaybackRequest, sharedAt time.Time, onConnected func()) error {
 	logInfof("gRPC stream: follower opening stream from leader target=%s session=%q audio_id=%q", target, req.SessionId, req.AudioId)
 
 	conn, stream, err := openFollowerStreamClient(ctx, target, req)
@@ -243,6 +243,15 @@ func (s *peerControlServer) receiveAudioFromLeader(ctx context.Context, target s
 		return err
 	}
 	defer conn.Close()
+
+	// The gRPC stream itself is open now - this is the point the caller's
+	// retry loop should count as "connected", distinct from "goroutine
+	// started" (setSessionCancel) and distinct from "still playing
+	// smoothly" (which isn't a single instant, it's the absence of an
+	// error for the rest of this function's lifetime).
+	if onConnected != nil {
+		onConnected()
+	}
 
 	init := s.buildFollowerPlayoutInit(req, target, sharedAt)
 	streamFormat := init.streamFormat
@@ -1164,6 +1173,7 @@ func (s *peerControlServer) receiveAudioFromLeader(ctx context.Context, target s
 		if now.Sub(lastHealthLogAt) >= healthLogInterval {
 			lastHealthLogAt = now
 			logHealth("periodic")
+			s.sessions().Heartbeat(req.SessionId)
 		}
 		if playoutStarted && !lastChunkAt.IsZero() && time.Since(lastChunkAt) >= receiveStallLogInterval && time.Since(lastStallLogAt) >= receiveStallLogInterval {
 			lastStallLogAt = time.Now()

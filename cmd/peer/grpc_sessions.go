@@ -17,38 +17,44 @@ var sessionLease = 30 * time.Second
 var leaderSessionReleaseCooldown = 1500 * time.Millisecond
 
 func (s *peerControlServer) beginSession(sessionID string) bool {
-	s.sessionMu.Lock()
-	defer s.sessionMu.Unlock()
+	_, ok := s.beginSessionAs(sessionID, roleUnknown)
+	return ok
+}
 
-	if s.activeSessions == nil {
-		s.activeSessions = make(map[string]time.Time)
-	}
-	if sessionID == "" {
-		sessionID = "default"
-	}
+func (s *peerControlServer) beginSessionAs(sessionID string, role sessionRole) (*sessionRecord, bool) {
+	return s.sessions().Begin(sessionID, role)
+}
 
-	now := time.Now()
-	normalised := normaliseSessionID(sessionID)
-	if _, active := s.sessionCancels[normalised]; active {
-		return false
-	}
-
-	if expiry, ok := s.activeSessions[normalised]; ok {
-		if now.Before(expiry) {
-			return false
-		}
-	}
-
-	s.activeSessions[normalised] = now.Add(sessionLease)
-	return true
+// sessions lazily initializes the session manager via sync.Once, kept
+// separate from sessionMu (which grpc_leader_shared.go also uses, for its
+// own unrelated maps) so this doesn't add contention there. This keeps
+// beginSession/etc. safe to call without every peerControlServer
+// construction site (tests included) needing to remember explicit setup.
+func (s *peerControlServer) sessions() *sessionManager {
+	s.sessionManagerOnce.Do(func() {
+		s.sessionManagerInstance = newSessionManager(sessionLease)
+	})
+	return s.sessionManagerInstance
 }
 
 func (s *peerControlServer) finishSession(sessionID string) {
-	s.sessionMu.Lock()
-	defer s.sessionMu.Unlock()
+	rec, ok := s.sessions().Get(sessionID)
+	if !ok {
+		return
+	}
+	// A session reaching finishSession with no recorded error is a normal,
+	// successful completion - record that explicitly rather than leaving
+	// success/failure implicit in "the entry is just gone now".
+	if rec.state == sessionActive || rec.state == sessionStarting || rec.state == sessionReconnecting {
+		s.sessions().Transition(sessionID, sessionEnded, nil)
+	}
+}
 
-	sessionID = normaliseSessionID(sessionID)
-	delete(s.activeSessions, sessionID)
+// failSession is the explicit failure counterpart to finishSession - use
+// this instead when a session is ending because of an error, so the
+// reason is recorded rather than looking identical to a clean stop.
+func (s *peerControlServer) failSessionState(sessionID string, err error) {
+	s.sessions().Transition(sessionID, sessionFailed, err)
 }
 
 func normaliseSessionID(sessionID string) string {
@@ -165,39 +171,20 @@ func (s *peerControlServer) startStreamOnFollower(ctx context.Context, follower 
 }
 
 func (s *peerControlServer) setSessionCancel(sessionID string, cancel context.CancelFunc) {
-	s.sessionMu.Lock()
-	defer s.sessionMu.Unlock()
-
-	if s.sessionCancels == nil {
-		s.sessionCancels = make(map[string]context.CancelFunc)
-	}
-	normalised := normaliseSessionID(sessionID)
-	s.sessionCancels[normalised] = cancel
-	logInfof("gRPC stream: registered cancellable session=%q", normalised)
+	s.sessions().SetCancel(sessionID, cancel)
+	// Registering a cancel func is what "we're actually up and running"
+	// looks like in practice for the existing call sites (it happens
+	// right as the follower/leader goroutine starts real work) - promote
+	// Starting -> Active here so the state machine reflects that.
+	s.sessions().Transition(sessionID, sessionActive, nil)
+	logInfof("gRPC stream: registered cancellable session=%q", normaliseSessionID(sessionID))
 }
 
 func (s *peerControlServer) clearSessionCancel(sessionID string) {
-	s.sessionMu.Lock()
-	defer s.sessionMu.Unlock()
-	normalised := normaliseSessionID(sessionID)
-	if _, ok := s.sessionCancels[normalised]; ok {
-		delete(s.sessionCancels, normalised)
-		logInfof("gRPC stream: cleared cancellable session=%q", normalised)
-	}
+	s.sessions().ClearCancel(sessionID)
+	logInfof("gRPC stream: cleared cancellable session=%q", normaliseSessionID(sessionID))
 }
 
 func (s *peerControlServer) cancelSession(sessionID string) bool {
-	s.sessionMu.Lock()
-	defer s.sessionMu.Unlock()
-
-	normalised := normaliseSessionID(sessionID)
-	cancel, ok := s.sessionCancels[normalised]
-	if !ok {
-		logInfof("gRPC stream: cancel requested for non-active session=%q", normalised)
-		return false
-	}
-	delete(s.sessionCancels, normalised)
-	logInfof("gRPC stream: canceling active session=%q", normalised)
-	cancel()
-	return true
+	return s.sessions().Cancel(sessionID)
 }

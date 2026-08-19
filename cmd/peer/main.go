@@ -89,7 +89,7 @@ func parseFlags() config {
 	captureDevice := flag.String("capture-device", "default", "system audio capture device (Linux PulseAudio/PipeWire monitor or Windows WASAPI endpoint, default auto device)")
 	streamCodec := flag.String("stream-codec", string(payloadCodecOpus), "stream codec to use for live capture (opus|pcm)")
 	opusBitrate := flag.Int("opus-bitrate", opus128kbpsBitrate, "Opus encoder bitrate in bits per second (only used if stream-codec=opus)")
-	opusImplementation := flag.String("opus-implementation", string(opusImplementationHraban), "Opus backend implementation to use: hraban|pion")
+	opusImplementation := flag.String("opus-implementation", string(opusImplementationPion), "Opus backend implementation to use: hraban|pion")
 	logMediaCmds := flag.Bool("log-media-cmds", true, "log ffmpeg/ffplay/aplay commands before execution and on failures")
 	streamJitterMS := flag.Int("stream-jitter-ms", 200, "target jitter buffer delay for streamed playback in milliseconds")
 	streamJitterAdaptive := flag.Bool("stream-jitter-adaptive", true, "adapt jitter buffer delay at runtime based on stream health")
@@ -358,6 +358,29 @@ func (a *peerApp) Run() error {
 	go func() {
 		if err := startGRPCServer(fmt.Sprintf("0.0.0.0:%d", a.cfg.grpcPort), a.grpcServer); err != nil {
 			logInfof("gRPC server stopped: %v", err)
+		}
+	}()
+
+	// Periodically sweep session state: clears old terminal (Ended/Failed)
+	// entries so the map doesn't grow unbounded over a long-lived room,
+	// and force-fails any session whose lease expired without a
+	// Heartbeat/Transition - which means the goroutine that owned it died
+	// (panicked, was killed, deadlocked) without going through normal
+	// cleanup. Without this, a session stuck that way only self-heals
+	// lazily on the next beginSession call for the same ID (see
+	// sessionManager.Begin's own lease-expiry check); this makes it
+	// proactive instead, and is what actually produces a visible log line
+	// explaining why a session went to Failed with no obvious cause.
+	go func() {
+		const sweepInterval = 10 * time.Second
+		const retainTerminal = 5 * time.Minute
+		ticker := time.NewTicker(sweepInterval)
+		defer ticker.Stop()
+		for range ticker.C {
+			if a.grpcServer == nil {
+				continue
+			}
+			a.grpcServer.sessions().Sweep(time.Now(), retainTerminal)
 		}
 	}()
 

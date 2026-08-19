@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/rand"
 	"net"
 	"os"
 	"strconv"
@@ -51,8 +52,8 @@ type peerControlServer struct {
 	chunkLogMu                  stdsync.Mutex
 	offsetState                 *latestOffset
 	sessionMu                   stdsync.Mutex
-	activeSessions              map[string]time.Time
-	sessionCancels              map[string]context.CancelFunc
+	sessionManagerOnce          stdsync.Once
+	sessionManagerInstance      *sessionManager
 	leaderStreams               map[string]*control.StreamPlaybackRequest
 	leaderSharedStreams         map[string]*leaderSharedStream
 }
@@ -68,10 +69,55 @@ const (
 	sinkWriteQueueCapacity  = 16
 	rejoinInitialBackoff    = 500 * time.Millisecond
 	rejoinMaxBackoff        = 5 * time.Second
+	rejoinMaxAttempts       = 20               // give up and surface a real failure rather than retrying forever
+	rejoinMaxElapsed        = 10 * time.Minute // secondary cap in case attempts alone isn't a good enough signal
 )
 
-func isSlowSubscriberDisconnect(err error) bool {
-	return err != nil && strings.Contains(strings.ToLower(err.Error()), "slow subscriber")
+// retryDecision classifies whether a disconnect is worth retrying, and
+// carries a human-readable reason so callers don't need to re-derive it
+// from the error text.
+type retryDecision struct {
+	retry  bool
+	reason string
+}
+
+// classifyDisconnect replaces the previous string-matching
+// (isSlowSubscriberDisconnect, which did strings.Contains on the error
+// text - fragile, since it silently stops matching if the leader's
+// message wording ever changes) with gRPC status codes, which are
+// structured and don't depend on message text.
+func classifyDisconnect(err error) retryDecision {
+	if err == nil {
+		return retryDecision{retry: false, reason: "clean end of stream"}
+	}
+	if errors.Is(err, context.Canceled) || status.Code(err) == codes.Canceled {
+		return retryDecision{retry: false, reason: "canceled (local shutdown or explicit stop)"}
+	}
+	switch status.Code(err) {
+	case codes.ResourceExhausted:
+		// Leader deliberately dropped us for falling too far behind -
+		// transient, worth retrying with backoff.
+		return retryDecision{retry: true, reason: "slow subscriber, leader dropped us"}
+	case codes.Unavailable, codes.DeadlineExceeded:
+		// Leader unreachable / RPC timed out - could be a network blip
+		// or the leader process restarting; worth retrying with backoff,
+		// but see codes.NotFound below for the case where the leader IS
+		// reachable but has no memory of this session (post-restart).
+		return retryDecision{retry: true, reason: "leader unreachable or RPC timeout"}
+	case codes.NotFound:
+		// Leader is reachable but doesn't recognize this session ID -
+		// almost certainly means the leader process restarted and lost
+		// all session state. Retrying the identical request will just
+		// get NotFound again forever; this needs a fresh
+		// StartStreamPlayback with current parameters, not a rejoin.
+		return retryDecision{retry: false, reason: "leader has no record of this session (leader likely restarted)"}
+	default:
+		// Anything else (DataLoss from a decode catastrophe, InvalidArgument,
+		// Unknown, etc.) is treated as non-retriable: retrying blindly
+		// against an error we don't recognize risks looping on something
+		// that will never succeed.
+		return retryDecision{retry: false, reason: fmt.Sprintf("unclassified error (%s), not retrying", status.Code(err))}
+	}
 }
 
 func normaliseChunkLogMode(mode string) string {
@@ -295,7 +341,11 @@ func (s *peerControlServer) StartStreamPlayback(_ context.Context, req *control.
 	logInfof("gRPC stream: StartStreamPlayback session=%q audio_id=%q audio_path=%q codec=%s shared_at=%s", sessionID, streamReq.AudioId, streamReq.AudioPath, streamReq.PayloadCodec, time.Unix(0, streamReq.SharedAtNanos).Format(time.RFC3339Nano))
 
 	// If this peer is already handling the same session, reject the duplicate request.
-	if !s.beginSession(sessionID) {
+	role := roleFollower
+	if s.isLeader {
+		role = roleLeader
+	}
+	if _, ok := s.beginSessionAs(sessionID, role); !ok {
 		logInfof("gRPC stream: ignoring duplicate session=%q", sessionID)
 		return &control.StreamPlaybackResponse{
 			Accepted:  true,
@@ -334,31 +384,61 @@ func (s *peerControlServer) startStreamPlaybackAsFollower(sessionID string, stre
 		runCtx, cancel := context.WithCancel(context.Background())
 		s.setSessionCancel(sessionID, cancel)
 		defer s.clearSessionCancel(sessionID)
-		defer s.finishSession(sessionID)
-		logInfof("gRPC stream: follower starting async receive session=%q target=%s at=%s format=%s rate=%d channels=%d", sessionID, target, time.Now().Format(time.RFC3339Nano), streamFormat.SampleFormat, streamFormat.SampleRate, streamFormat.Channels)
+
+		attemptStartedAt := time.Now()
 		backoff := rejoinInitialBackoff
+		attempts := 0
+
+		onConnected := func() {
+			s.sessions().Transition(sessionID, sessionActive, nil)
+		}
+
 		for {
-			err := s.receiveAudioFromLeader(runCtx, target, streamReq, sharedAt)
-			if err == nil || !isSlowSubscriberDisconnect(err) {
-				if err != nil {
-					if errors.Is(err, context.Canceled) || status.Code(err) == codes.Canceled {
-						logInfof("gRPC stream: follower stream stopped session=%q", sessionID)
-						return
-					}
-					logWarnf("gRPC stream: follower failed to receive session=%q from leader: %v", sessionID, err)
-				}
+			err := s.receiveAudioFromLeader(runCtx, target, streamReq, sharedAt, onConnected)
+			if err == nil {
+				logInfof("gRPC stream: follower stream ended cleanly session=%q", sessionID)
+				s.finishSession(sessionID)
 				return
 			}
 
-			// Slow-subscriber disconnects are retriable; use bounded exponential backoff.
-			logWarnf("gRPC stream: follower rejoining after slow-subscriber disconnect session=%q target=%s retry_in=%s: %v", sessionID, target, backoff, err)
-			timer := time.NewTimer(backoff)
+			decision := classifyDisconnect(err)
+			if !decision.retry {
+				if errors.Is(err, context.Canceled) || status.Code(err) == codes.Canceled {
+					logInfof("gRPC stream: follower stream stopped session=%q", sessionID)
+					s.finishSession(sessionID)
+					return
+				}
+				logWarnf("gRPC stream: follower failed to receive session=%q from leader: %v (%s)", sessionID, err, decision.reason)
+				s.failSessionState(sessionID, err)
+				return
+			}
+
+			attempts++
+			elapsed := time.Since(attemptStartedAt)
+			if attempts > rejoinMaxAttempts || elapsed > rejoinMaxElapsed {
+				giveUpErr := fmt.Errorf("giving up after %d attempts over %s: %w", attempts, elapsed, err)
+				logWarnf("gRPC stream: follower exhausted rejoin attempts session=%q target=%s attempts=%d elapsed=%s: %v", sessionID, target, attempts, elapsed, err)
+				s.failSessionState(sessionID, giveUpErr)
+				return
+			}
+
+			s.sessions().Transition(sessionID, sessionReconnecting, err)
+			// Full jitter: a random duration between zero and backoff,
+			// not just the backoff value itself. Without jitter, several followers that
+			// all got dropped by the same leader event (e.g. leader
+			// restart) would all retry in lockstep and hammer the leader
+			// at the same instants repeatedly.
+			sleepFor := time.Duration(rand.Int63n(int64(backoff)))
+			logWarnf("gRPC stream: follower rejoining after disconnect session=%q target=%s attempt=%d/%d retry_in=%s reason=%q: %v", sessionID, target, attempts, rejoinMaxAttempts, sleepFor, decision.reason, err)
+
+			timer := time.NewTimer(sleepFor)
 			select {
 			case <-runCtx.Done():
 				if !timer.Stop() {
 					<-timer.C
 				}
 				logInfof("gRPC stream: follower stream stopped during rejoin session=%q", sessionID)
+				s.finishSession(sessionID)
 				return
 			case <-timer.C:
 			}
@@ -382,7 +462,6 @@ func (s *peerControlServer) startStreamPlaybackAsLeader(sessionID string, stream
 
 	peers := s.pl.Peers()
 	logInfof("gRPC stream: leader starting stream session=%q for %d follower(s)", streamReq.SessionId, len(peers))
-	var kickoffWG stdsync.WaitGroup
 	kickoffCount := 0
 
 	for _, p := range peers {
@@ -392,29 +471,11 @@ func (s *peerControlServer) startStreamPlaybackAsLeader(sessionID string, stream
 
 		follower := p
 		kickoffCount++
-		kickoffWG.Add(1)
 		go func() {
-			defer kickoffWG.Done()
 			s.startStreamOnFollower(context.Background(), follower, streamReq)
 		}()
 	}
-
-	// Keep the leader session lease briefly after kickoff so late-join and stop commands
-	// have a stable session to target while followers are connecting.
-	if kickoffCount == 0 {
-		go func(sessionID string) {
-			time.Sleep(leaderSessionReleaseCooldown)
-			s.finishSession(sessionID)
-			logInfof("gRPC stream: leader released session=%q after cooldown=%s (no followers)", sessionID, leaderSessionReleaseCooldown)
-		}(sessionID)
-	} else {
-		go func(sessionID string, fanoutCount int) {
-			kickoffWG.Wait()
-			time.Sleep(leaderSessionReleaseCooldown)
-			s.finishSession(sessionID)
-			logInfof("gRPC stream: leader released session=%q after kickoff completion followers=%d cooldown=%s", sessionID, fanoutCount, leaderSessionReleaseCooldown)
-		}(sessionID, kickoffCount)
-	}
+	logInfof("gRPC stream: leader started stream session=%q kickoff_count=%d", streamReq.SessionId, kickoffCount)
 }
 
 func (s *peerControlServer) JoinStreamPlayback(ctx context.Context, req *control.JoinStreamRequest) (*control.JoinStreamResponse, error) {

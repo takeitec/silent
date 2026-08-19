@@ -8,8 +8,10 @@ import (
 	stdsync "sync"
 	"time"
 
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/peer"
+	"google.golang.org/grpc/status"
 
 	"silent/internal/control"
 )
@@ -216,6 +218,32 @@ func (s *peerControlServer) getOrCreateLeaderSharedStream(req *control.StreamPla
 	}
 	s.sessionMu.Unlock()
 
+	// This is the leader/follower restart contract: only ever open a new
+	// audio source using the leader's OWN authoritative parameters (the
+	// template this peer stored when it locally handled
+	// StartStreamPlayback as leader), never the inbound subscriber's
+	// req. Previously this used req directly, which meant any StreamAudio
+	// call for an unrecognized session ID would silently spin up a fresh
+	// capture pipeline using whatever parameters the CALLER happened to
+	// send - including a follower retrying with a stale cached request
+	// against a leader process that had restarted and lost all memory of
+	// the session. That's implicit, accidental behavior, not a designed
+	// restart path - and it lets a subscriber dictate what the leader
+	// captures, which is backwards.
+	//
+	// With this change: after a leader restart, a reconnecting follower
+	// gets a clear, structural NotFound (see classifyDisconnect in
+	// grpc.go), and its retry loop treats that as terminal rather than
+	// retrying forever - the correct fix is a fresh, operator-initiated
+	// StartStreamPlayback against the restarted leader, not an implicit
+	// resurrection from stale follower state.
+	authoritative, ok := s.loadLeaderStream(sessionID)
+	if !ok {
+		return nil, status.Errorf(codes.NotFound, "no leader session %q (leader may have restarted; a fresh StartStreamPlayback is required)", sessionID)
+	}
+	req = authoritative
+	format = normaliseStreamPlaybackRequest(req)
+
 	source, sourceName, closeSource, err := s.openStreamSource(req)
 	if err != nil {
 		return nil, err
@@ -395,6 +423,19 @@ func (s *peerControlServer) appendLeaderSharedChunk(ls *leaderSharedStream, chun
 }
 
 func (s *peerControlServer) runLeaderSharedProducer(req *control.StreamPlaybackRequest, ls *leaderSharedStream) {
+	runCtx, cancel := context.WithCancel(context.Background())
+	ctxExitLog := fmt.Sprintf("gRPC stream: leader shared producer exiting session=%q due to context cancellation", ls.sessionID)
+	go func() {
+		// This goroutine will force closing the stream even if io.ReadFull is blocked on the source
+		<-runCtx.Done()
+		ls.closeStream()
+		logInfof(ctxExitLog)
+	}()
+	s.setSessionCancel(ls.sessionID, cancel)
+	defer s.clearSessionCancel(ls.sessionID)
+	defer s.closeLeaderSharedStream(ls.sessionID, nil)
+	defer s.finishSession(ls.sessionID)
+
 	buf := make([]byte, ls.format.ChunkBytes)
 	chunkDur := streamChunkDuration(ls.format)
 	paceStream := ls.sourceName != "live-capture" && chunkDur > 0
@@ -406,14 +447,28 @@ func (s *peerControlServer) runLeaderSharedProducer(req *control.StreamPlaybackR
 	failSession := func(err error) {
 		ls.logHealth("producer-failed")
 		s.closeLeaderSharedStream(ls.sessionID, err)
-		s.stopLeaderSession(context.Background(), ls.sessionID, err.Error())
+		s.stopLeaderSession(runCtx, ls.sessionID, err.Error())
+		s.failSessionState(ls.sessionID, err)
 	}
 
 	const maxConsecutiveEncodeErrors = 25 // ~500ms of continuous failure at 20ms/chunk
 	consecutiveEncodeErrors := 0
 
 	for {
+		select {
+		case <-runCtx.Done():
+			logInfof(ctxExitLog)
+			return
+		default:
+		}
+
 		n, err := io.ReadFull(ls.source, buf)
+		select {
+		case <-runCtx.Done():
+			logInfof(ctxExitLog)
+			return
+		default:
+		}
 
 		if n == len(buf) {
 			payload := buf[:n]
@@ -480,6 +535,7 @@ func (s *peerControlServer) runLeaderSharedProducer(req *control.StreamPlaybackR
 			if time.Since(lastHealthLogAt) >= leaderSharedHealthLogInterval {
 				ls.logHealth("producer-periodic")
 				lastHealthLogAt = time.Now()
+				s.sessions().Heartbeat(ls.sessionID)
 			}
 			if paceStream {
 				nextSendAt = nextSendAt.Add(chunkDur)
@@ -515,6 +571,10 @@ func (s *peerControlServer) runLeaderSharedProducer(req *control.StreamPlaybackR
 			return
 		}
 		if err != nil {
+			if runCtx.Err() != nil {
+				logInfof("gRPC stream: leader shared producer exiting session=%q due to context cancellation", ls.sessionID)
+				return
+			}
 			failSession(fmt.Errorf("capture read failed: %w", err))
 			return
 		}
@@ -599,7 +659,7 @@ func (s *peerControlServer) streamAudioFromLeaderShared(req *control.StreamPlayb
 				sub.nextSeq = ls.startSeq
 				if sub.dropWindowCount >= leaderSlowDropLimit {
 					ls.metrics.SlowDisconnects++
-					err := fmt.Errorf("slow subscriber dropped=%d window=%s", sub.dropWindowCount, leaderSlowDropWindow)
+					err := status.Errorf(codes.ResourceExhausted, "slow subscriber dropped=%d window=%s", sub.dropWindowCount, leaderSlowDropWindow)
 					ls.mu.Unlock()
 					logWarnf("gRPC stream: leader disconnecting slow subscriber session=%q target=%s dropped_in_window=%d limit=%d", ls.sessionID, sub.target, sub.dropWindowCount, leaderSlowDropLimit)
 					sub.fail(err)

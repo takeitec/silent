@@ -9,8 +9,10 @@ import (
 	"testing"
 	"time"
 
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/peer"
+	"google.golang.org/grpc/status"
 )
 
 func TestBeginSessionRejectsDuplicateUntilLeaseExpires(t *testing.T) {
@@ -58,8 +60,13 @@ func TestBeginSessionExpiresAfterLease(t *testing.T) {
 	}
 
 	time.Sleep(20 * time.Millisecond)
+	if srv.beginSession("demo-session") {
+		t.Fatalf("expected duplicate session start to remain rejected until sweep runs")
+	}
+
+	srv.sessions().Sweep(time.Now(), time.Minute)
 	if !srv.beginSession("demo-session") {
-		t.Fatalf("expected session to be accepted again after lease expiry")
+		t.Fatalf("expected session to be accepted again after sweep marks lease-expired session terminal")
 	}
 }
 
@@ -68,14 +75,16 @@ func TestBeginSessionRejectsDuplicateWhenActiveCancelExists(t *testing.T) {
 	defer func() { sessionLease = originalLease }()
 
 	sessionLease = 10 * time.Millisecond
-	srv := &peerControlServer{
-		sessionCancels: map[string]context.CancelFunc{
-			"demo-session": func() {},
-		},
+	srv := &peerControlServer{}
+
+	if !srv.beginSession("demo-session") {
+		t.Fatalf("expected first session start to succeed")
 	}
 
+	srv.sessions().Transition("demo-session", sessionActive, nil)
+
 	if srv.beginSession("demo-session") {
-		t.Fatalf("expected duplicate session start to be rejected while active cancel exists")
+		t.Fatalf("expected duplicate session start to be rejected while active")
 	}
 }
 
@@ -112,12 +121,30 @@ func TestStreamTargetUsesMetadataFallback(t *testing.T) {
 	}
 }
 
-func TestIsSlowSubscriberDisconnect(t *testing.T) {
-	if !isSlowSubscriberDisconnect(errors.New("slow subscriber dropped=200 window=5s")) {
-		t.Fatal("expected slow subscriber error to be rejoinable")
+func TestClassifyDisconnect(t *testing.T) {
+	retriable := status.Errorf(codes.ResourceExhausted, "slow subscriber dropped=200 window=5s")
+	if d := classifyDisconnect(retriable); !d.retry {
+		t.Fatalf("expected ResourceExhausted to be retriable, got %+v", d)
 	}
-	if isSlowSubscriberDisconnect(errors.New("rpc error: code = Unavailable desc = connection reset")) {
-		t.Fatal("did not expect unrelated transport error to be rejoinable")
+
+	unavailable := status.Errorf(codes.Unavailable, "connection reset")
+	if d := classifyDisconnect(unavailable); !d.retry {
+		t.Fatalf("expected Unavailable to be retriable, got %+v", d)
+	}
+
+	notFound := status.Errorf(codes.NotFound, "no leader session %q", "demo-session")
+	if d := classifyDisconnect(notFound); d.retry {
+		t.Fatalf("expected NotFound to be terminal (leader restarted), got %+v", d)
+	}
+
+	canceled := status.Errorf(codes.Canceled, "context canceled")
+	if d := classifyDisconnect(canceled); d.retry {
+		t.Fatalf("expected Canceled to be terminal, got %+v", d)
+	}
+
+	unrelated := errors.New("some unrelated plain error")
+	if d := classifyDisconnect(unrelated); d.retry {
+		t.Fatalf("expected an unclassified plain error to be treated as non-retriable, got %+v", d)
 	}
 }
 
